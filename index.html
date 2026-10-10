@@ -134,8 +134,10 @@
     .badge strong { color: var(--gold); }
 
     /* Scope Bar */
-    .scope-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--panelLine); padding: 4px 10px; border-radius: 6px; margin-bottom: 8px; font-size: 11px; gap: 4px; }
-    .scope-bar select { background: var(--mat); color: var(--chalk); border: 1px solid var(--panelLine); border-radius: 4px; padding: 4px 8px; font-size: 11px; outline: none; }
+    .scope-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--panelLine); padding: 2px 8px; border-radius: 6px; margin-bottom: 6px; font-size: 10px; gap: 2px; }
+    .scope-bar select { background: var(--mat); color: var(--chalk); border: 1px solid var(--panelLine); border-radius: 4px; padding: 2px 6px; font-size: 10px; outline: none; min-height: 24px; }
+    .scope-bar .btn-toolbar { padding: 3px 10px; font-size: 10px; min-height: 24px; }
+    .scope-bar .sw-io-badge { width: 18px; height: 18px; font-size: 9px; }
     .record-display { font-family: monospace; font-weight: 700; color: var(--gold); }
 
     /* Navigation */
@@ -463,9 +465,9 @@
     </div>
 
     <!-- Team / Season / Event / Save — single bar under banner -->
-    <div class="scope-bar" style="flex-direction:column; align-items:stretch; gap:8px;">
-      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:space-between;">
-        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; min-width:0;">
+    <div class="scope-bar" style="flex-direction:column; align-items:stretch; gap:4px;">
+      <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; justify-content:space-between;">
+        <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-width:0;">
           <span id="scope-team-name" style="font-weight:800; color:var(--teamColor); font-family:var(--teamFont); text-transform:uppercase; letter-spacing:0.3px;"></span>
           <span id="dual-record-details" class="record-display" style="margin-left:4px; font-family:var(--teamFont);">Boys: 0-0-0 | Girls: 0-0-0</span>
           <span id="scope-ruleset-slot" style="margin-left:4px;"></span>
@@ -787,6 +789,8 @@
     const TRIAL_DAYS = 90;
     /** GitHub owner/repo for in-app bug reports (Issues). Change to your real repo. */
     const SW_BUG_REPORT_GITHUB_REPO = "CannonFodderrr/Strategic-Wrestler";
+    /** MatSide issues go here (change if your MatSide repo path differs). */
+    const MATSIDE_BUG_REPORT_GITHUB_REPO = "CannonFodderrr/Mat-Scorer";
     /**
      * Supabase license server. Fill in your project URL and anon/publishable key
      * (the anon key is public by design; never use the service_role key here).
@@ -2150,6 +2154,8 @@
       /** Preferred Gemini model id (tried first) */
       preferredAiModel: "gemini-3.6-flash",
       downloadTarget: "drive", // local | drive — prefer Drive when connected
+      /** When true, top-bar Save prunes backup JSON files older than 5 days (Drive + local). */
+      pruneBackupsAfter5Days: true,
       /** Division pronouns: "boysGirls" (default) or "menWomen" */
       divisionPronouns: "boysGirls",
       /** Phase 4/5 — your hosted Supabase project (customers do not create one) */
@@ -3060,6 +3066,10 @@
       if (idb) h += '<br/>Persistence: <strong>' + swEsc(persistedTxt) + '</strong>';
       if (SWDB.lastSavedAt()) h += '<br/>Last disk write: <strong>' + swEsc(new Date(SWDB.lastSavedAt()).toLocaleString()) + '</strong>';
       h += '</div>';
+      const pruneOn = appConfig.pruneBackupsAfter5Days !== false;
+      h += '<label style="display:flex; align-items:flex-start; gap:8px; margin-top:10px; font-size:11px; color:var(--chalk); cursor:pointer; line-height:1.4;">';
+      h += '<input type="checkbox" style="margin-top:2px;" ' + (pruneOn ? 'checked' : '') + ' onchange="appConfig.pruneBackupsAfter5Days = this.checked; persist();" />';
+      h += '<span><strong>Keep only 5 days of top-bar Saves</strong><br/><span style="color:var(--muted);">When checked, older backup JSON files in the Drive/local Backups folder are removed after each Save. Uncheck to keep all saves.</span></span></label>';
       h += '<div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;">';
       if (idb) {
         h += '<button class="btn btn-green" style="font-size:11px;" onclick="swSnapshotNow()">Create Snapshot Now</button>';
@@ -3140,6 +3150,11 @@
           name: season.name,
           style: season.style || "Folkstyle",
           locked: !!season.locked
+        },
+        weightClasses: {
+          Boys: (weightClasses && weightClasses.Boys) ? weightClasses.Boys.slice() : [],
+          Girls: (weightClasses && weightClasses.Girls) ? weightClasses.Girls.slice() : [],
+          girlsUseBoysWeightClasses: !!(appConfig && appConfig.girlsUseBoysWeightClasses)
         },
         roster: (season.roster || []).map(w => ({
           id: w.id,
@@ -3739,6 +3754,7 @@
     }
     function persistNow() {
       if (_persistTimer) { clearTimeout(_persistTimer); _persistTimer = null; }
+      if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly()) return;
       try {
         SWDB.setItem(STORAGE_KEY, JSON.stringify(store));
         SWDB.setItem(TAXONOMY_STORAGE_KEY, JSON.stringify(taxonomy));
@@ -3921,9 +3937,12 @@
     let presencePollTimer = null;
     let presenceOthers = [];
     let presenceLastPush = 0;
-    const PRESENCE_HEARTBEAT_MS = 25000;
-    const PRESENCE_STALE_MS = 90000;
-    const PRESENCE_POLL_MS = 20000;
+    /** True while this device holds the editor seat (earliest active session). */
+    let presenceIAmEditor = true;
+    let presenceMySessionStartedAt = null;
+    const PRESENCE_HEARTBEAT_MS = 60 * 60 * 1000; // hourly keepalive while tab open
+    const PRESENCE_STALE_MS = 2 * 60 * 60 * 1000; // 2h without heartbeat → not shown as active
+    const PRESENCE_POLL_MS = 5 * 60 * 1000; // poll other coaches every 5 minutes
 
     function getPresenceDeviceId() {
       if (presenceDeviceId) return presenceDeviceId;
@@ -3966,25 +3985,47 @@
           "presence?license_id=eq." + encodeURIComponent(state.supabaseLicenseId) +
           "&google_email=eq." + encodeURIComponent(email) +
           "&device_id=eq." + encodeURIComponent(device);
-        const existing = await supabaseRest(q + "&select=id&limit=1", { method: "GET" });
+        let existing = null;
+        try {
+          existing = await supabaseRest(q + "&select=id,session_started_at&limit=1", { method: "GET" });
+        } catch (eSel) {
+          existing = await supabaseRest(q + "&select=id&limit=1", { method: "GET" });
+        }
         if (Array.isArray(existing) && existing[0] && existing[0].id) {
+          if (existing[0].session_started_at) presenceMySessionStartedAt = existing[0].session_started_at;
           await supabaseRest("presence?id=eq." + encodeURIComponent(existing[0].id), {
             method: "PATCH",
             prefer: "return=minimal",
             body: { last_seen_at: nowIso, display_name: state.schoolName || email }
           });
         } else {
-          await supabaseRest("presence", {
-            method: "POST",
-            prefer: "return=minimal",
-            body: {
-              license_id: state.supabaseLicenseId,
-              google_email: email,
-              display_name: state.schoolName || email,
-              device_id: device,
-              last_seen_at: nowIso
-            }
-          });
+          presenceMySessionStartedAt = nowIso;
+          try {
+            await supabaseRest("presence", {
+              method: "POST",
+              prefer: "return=minimal",
+              body: {
+                license_id: state.supabaseLicenseId,
+                google_email: email,
+                display_name: state.schoolName || email,
+                device_id: device,
+                last_seen_at: nowIso,
+                session_started_at: nowIso
+              }
+            });
+          } catch (postErr) {
+            await supabaseRest("presence", {
+              method: "POST",
+              prefer: "return=minimal",
+              body: {
+                license_id: state.supabaseLicenseId,
+                google_email: email,
+                display_name: state.schoolName || email,
+                device_id: device,
+                last_seen_at: nowIso
+              }
+            });
+          }
         }
         presenceLastPush = Date.now();
       } catch (e) {
@@ -3995,17 +4036,27 @@
     async function refreshPresenceOthers() {
       if (!presenceEligible()) {
         presenceOthers = [];
+        presenceIAmEditor = true;
         updatePresenceBar();
         return;
       }
       const state = ensureLicenseState();
       const me = presenceMyEmail();
       try {
-        const rows = await supabaseRest(
-          "presence?license_id=eq." + encodeURIComponent(state.supabaseLicenseId) +
-          "&select=google_email,display_name,last_seen_at,device_id&order=last_seen_at.desc&limit=30",
-          { method: "GET" }
-        );
+        let rows;
+        try {
+          rows = await supabaseRest(
+            "presence?license_id=eq." + encodeURIComponent(state.supabaseLicenseId) +
+            "&select=google_email,display_name,last_seen_at,device_id,session_started_at&order=last_seen_at.desc&limit=30",
+            { method: "GET" }
+          );
+        } catch (selErr) {
+          rows = await supabaseRest(
+            "presence?license_id=eq." + encodeURIComponent(state.supabaseLicenseId) +
+            "&select=google_email,display_name,last_seen_at,device_id&order=last_seen_at.desc&limit=30",
+            { method: "GET" }
+          );
+        }
         const cutoff = Date.now() - PRESENCE_STALE_MS;
         const map = {};
         (Array.isArray(rows) ? rows : []).forEach(r => {
@@ -4018,15 +4069,70 @@
           }
         });
         presenceOthers = Object.keys(map).map(k => map[k]);
+        // Editor seat = earliest session_started_at among non-stale rows (fallback last_seen)
+        const device = getPresenceDeviceId();
+        const cutoff2 = Date.now() - PRESENCE_STALE_MS;
+        const allActive = [];
+        (Array.isArray(rows) ? rows : []).forEach(function (r) {
+          const t = Date.parse(r.last_seen_at || 0);
+          if (isNaN(t) || t < cutoff2) return;
+          allActive.push(r);
+        });
+        let iAmEditor = true;
+        if (allActive.length) {
+          const startOf = function (r) {
+            const s = Date.parse(r.session_started_at || 0);
+            if (!isNaN(s) && s > 0) return s;
+            return Date.parse(r.last_seen_at || 0) || Number.MAX_SAFE_INTEGER;
+          };
+          allActive.sort(function (a, b) { return startOf(a) - startOf(b); });
+          const editor = allActive[0];
+          const editorEmail = String(editor.google_email || "").trim().toLowerCase();
+          const editorDevice = String(editor.device_id || "");
+          iAmEditor = (editorEmail === me && (!editorDevice || editorDevice === device));
+          if (editorEmail === me && editorDevice && editorDevice !== device) iAmEditor = false;
+        }
+        const wasEditor = presenceIAmEditor;
+        presenceIAmEditor = iAmEditor;
+        if (wasEditor !== iAmEditor) {
+          try {
+            if (!iAmEditor && (currentTab === "scout" || currentTab === "admin")) {
+              currentTab = "roster";
+              document.querySelectorAll(".tab-btn").forEach(function (btn, idx) {
+                btn.classList.toggle("active", ["roster", "scout", "sheet", "stats", "plan", "calendar", "admin"][idx] === "roster");
+              });
+            }
+            if (typeof render === "function") render();
+          } catch (e3) {}
+        }
       } catch (e) {
         console.warn("presence refresh", e);
       }
-      updatePresenceBar();
+      try { updatePresenceBar(); } catch (e) {}
     }
 
     function updatePresenceBar() {
       const el = document.getElementById("sw-presence-bar");
       if (!el) return;
+      try {
+        const vo = (typeof isPresenceViewOnly === "function") ? isPresenceViewOnly() : false;
+        document.querySelectorAll(".tab-btn").forEach(function (btn) {
+          const label = (btn.textContent || "").trim().toLowerCase();
+          const locked = vo && (label === "scout" || label === "admin");
+          btn.disabled = !!locked;
+          btn.style.opacity = locked ? "0.45" : "";
+          btn.style.cursor = locked ? "not-allowed" : "";
+          btn.title = locked ? "Locked while another coach is editing this license" : "";
+        });
+        document.querySelectorAll(".scope-bar button").forEach(function (b) {
+          const t = (b.textContent || "").trim().toLowerCase();
+          if (t === "save" || t === "load") {
+            b.disabled = !!vo;
+            b.style.opacity = vo ? "0.45" : "";
+            if (vo) b.title = "Save/Load locked while another coach is editing";
+          }
+        });
+      } catch (e) {}
       if (!presenceEligible()) {
         el.style.display = "none";
         el.className = "sw-presence-bar";
@@ -4034,19 +4140,27 @@
         return;
       }
       el.style.display = "flex";
-      if (!presenceOthers.length) {
+      if (!presenceOthers.length && presenceIAmEditor) {
         el.className = "sw-presence-bar";
-        el.innerHTML = '<span class="sw-presence-dot"></span><span>Only you active on this license</span>';
+        el.innerHTML = '<span class="sw-presence-dot"></span><span>Only you active on this license · editing unlocked</span>';
         return;
       }
       const names = presenceOthers.map(o => {
         const n = String(o.display_name || o.google_email || "");
         return n.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       }).join(", ");
+      if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly()) {
+        el.className = "sw-presence-bar sw-presence-others";
+        el.innerHTML =
+          '<span class="sw-presence-dot"></span>' +
+          "<span><strong>View-only</strong> — " + (names || "another coach") +
+          " is editing. Scout &amp; Admin locked. Print and review pages are available.</span>";
+        return;
+      }
       el.className = "sw-presence-bar sw-presence-others";
       el.innerHTML =
         '<span class="sw-presence-dot"></span>' +
-        "<span><strong>Also active:</strong> " + names + "</span>";
+        "<span><strong>You are editing.</strong> Also viewing: " + (names || "—") + "</span>";
     }
 
     function startPresenceSystem() {
@@ -4063,18 +4177,70 @@
       if (presencePollTimer) { clearInterval(presencePollTimer); presencePollTimer = null; }
     }
 
+    /** Best-effort sign-off so other coaches stop seeing this session as active. */
+    function signOffPresence() {
+      try {
+        if (!presenceEligible()) return;
+        const state = ensureLicenseState();
+        const email = presenceMyEmail();
+        const device = getPresenceDeviceId();
+        if (!email || !state || !state.supabaseLicenseId) return;
+        const q =
+          "presence?license_id=eq." + encodeURIComponent(state.supabaseLicenseId) +
+          "&google_email=eq." + encodeURIComponent(email) +
+          "&device_id=eq." + encodeURIComponent(device);
+        // Fire-and-forget DELETE (keepalive when available)
+        if (typeof supabaseRest === "function") {
+          try { supabaseRest(q, { method: "DELETE" }); } catch (e) {}
+        }
+        try {
+          const base = (typeof getSupabaseUrl === "function" ? getSupabaseUrl() : "") || "";
+          const key = (typeof getSupabaseKey === "function" ? getSupabaseKey() : "") || "";
+          if (base && key && typeof fetch === "function") {
+            fetch(base + "/rest/v1/" + q, {
+              method: "DELETE",
+              headers: { apikey: key, Authorization: "Bearer " + key, Prefer: "return=minimal" },
+              keepalive: true
+            }).catch(function () {});
+          }
+        } catch (e) {}
+      } catch (e) {}
+    }
+
     function otherCoachesActiveRecently() {
       return Array.isArray(presenceOthers) && presenceOthers.length > 0;
     }
 
+    /** True when another coach holds the editor seat on this license. */
+    function isPresenceViewOnly() {
+      if (typeof presenceEligible === "function" && !presenceEligible()) return false;
+      return presenceIAmEditor === false;
+    }
+
+    function presenceEditorLabel() {
+      if (!Array.isArray(presenceOthers) || !presenceOthers.length) return "another coach";
+      const o = presenceOthers[0];
+      return o.display_name || o.google_email || "another coach";
+    }
+
+    function guardPresenceEdit(actionLabel) {
+      if (!isPresenceViewOnly()) return false;
+      try {
+        toast(
+          "View-only: " + presenceEditorLabel() + " is editing this license.\n\n" +
+          "You can browse Roster, Bout Sheet, Stats, Training Plan, and Calendar and use Print. " +
+          "Scout and Admin are locked until they close Strategic Wrestler." +
+          (actionLabel ? ("\n\nBlocked: " + actionLabel) : ""),
+          "info",
+          7000
+        );
+      } catch (e) {}
+      return true;
+    }
+
     function confirmSaveIfOthersActive() {
-      if (!otherCoachesActiveRecently()) return true;
-      const names = presenceOthers.map(o => o.display_name || o.google_email).join(", ");
-      return confirm(
-        "Other coach(es) may be using Strategic Wrestler on this license:\\n\\n" +
-        names +
-        "\\n\\nSaving now might overwrite their unsaved work if you share the same Drive backups.\\n\\nSave anyway?"
-      );
+      if (guardPresenceEdit("Save")) return false;
+      return true;
     }
 
     try {
@@ -4302,6 +4468,7 @@
     }
 
     function guardSeasonLocked(actionLabel) {
+      if (typeof guardPresenceEdit === "function" && guardPresenceEdit(actionLabel || "edit")) return true;
       if (isSeasonLocked()) {
         toast(`This season is finalized and locked.\n\nReopen it from Admin → Season Archive & Storage before ${actionLabel || "making changes"}.`);
         return true;
@@ -4925,6 +5092,10 @@
     }
 
     function switchTab(tab) {
+      if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly() && (tab === "scout" || tab === "admin")) {
+        try { guardPresenceEdit(tab === "scout" ? "Scout" : "Admin"); } catch (e) {}
+        return;
+      }
       if (activeMatch && currentTab === "scout" && tab !== "scout") {
         const ok = confirm(
           "You have an unsaved scoring session in progress.\n\n" +
@@ -5044,6 +5215,11 @@
           try { URL.revokeObjectURL(videoBlobUrl); } catch (e) {}
           videoBlobUrl = null;
         }
+        try { if (typeof signOffPresence === "function") signOffPresence(); } catch (e) {}
+        try { if (typeof stopPresenceSystem === "function") stopPresenceSystem(); } catch (e) {}
+      });
+      window.addEventListener("pagehide", () => {
+        try { if (typeof signOffPresence === "function") signOffPresence(); } catch (e) {}
       });
     }
 
@@ -5835,14 +6011,14 @@
           <div style="display:flex; flex-direction:column; gap:6px;">
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
               <input id="r-name" class="input" style="flex:2; min-width:130px; margin-bottom:0;" placeholder="Wrestler Name" />
+              <select id="r-div" class="select" style="flex:1; min-width:95px; margin-bottom:0;" onchange="filterRosterWeightOptions(this.value)">
+                <option value="Boys">Boys</option>
+                <option value="Girls">Girls</option>
+              </select>
               <select id="r-weight" class="select" style="flex:1; min-width:110px; margin-bottom:0;">
                 <option value="">Weight Class (lbs)</option>
                 ${(weightClasses.Boys || []).map(w => `<option value="${swEsc(w)}">${swEsc(w)} (Boys)</option>`).join("")}
                 ${(weightClasses.Girls || []).map(w => `<option value="${swEsc(w)}">${swEsc(w)} (Girls)</option>`).join("")}
-              </select>
-              <select id="r-div" class="select" style="flex:1; min-width:95px; margin-bottom:0;" onchange="filterRosterWeightOptions(this.value)">
-                <option value="Boys">Boys</option>
-                <option value="Girls">Girls</option>
               </select>
             </div>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
@@ -9919,16 +10095,17 @@
                 <div style="font-size:14px; font-weight:800; color:var(--gold); text-transform:uppercase;">Season Match Ledger</div>
                 <div style="font-size:11px; color:var(--muted);">${swEsc(season.name)} · All Competitions · filtered by selected athlete (choose an Event above for the full dual bout sheet)</div>
               </div>
-              <div style="display:flex; gap:8px; align-items:center;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                 <span class="sec-label">Select Athlete:</span>
                 <select class="select" style="margin-bottom:0; width:auto; font-size:12px; font-weight:700;" onchange="setActiveWrestler(this.value)">
                   ${sortedRoster.map(w => `<option value="${swEsc(w.id)}" ${activeW && w.id === activeW.id ? 'selected' : ''}>${swEsc(w.name)} (${swEsc(w.weightClass)} lbs - ${swEsc(w.level)})</option>`).join('')}
                 </select>
+                <button type="button" class="btn btn-gold btn-toolbar" onclick="printSeasonMatchLedger()">Print Ledger</button>
                 ${helpIcon('bout_sheet')}
               </div>
             </div>
 
-            <table class="sheet-table">
+            <table class="sheet-table" id="season-match-ledger-table">
               <thead>
                 <tr>
                   <th>Date</th>
@@ -11369,6 +11546,8 @@
           ]
         : [
             { key: "Takedown", label: "Takedowns Scored On", expandable: true },
+            { key: "FirstTdAgainst", label: "1st Takedowns", expandable: false },
+            { key: "FirstTdAgainstPct", label: "1st Takedown %", expandable: false },
             { key: "Near Fall / Pin", label: "Near Falls Scored On", expandable: true },
             { key: "Turns", label: "Turns Scored On", expandable: true },
             { key: "Reversal", label: "Reversals Allowed", expandable: true },
@@ -11399,6 +11578,21 @@
             const ft = computeFirstTakedownStats(w.id);
             if (ft.contests >= 1 && ft.pct != null) {
               leaders.push({ ...w, val: ft.pct, displayVal: ft.pct + "% (" + ft.ourFirst + "/" + ft.contests + ")" });
+            }
+            return;
+          }
+          if (box.key === "FirstTdAgainst") {
+            const ft = computeFirstTakedownStats(w.id);
+            if (ft.oppFirst > 0) {
+              leaders.push({ ...w, val: ft.oppFirst, displayVal: String(ft.oppFirst) });
+            }
+            return;
+          }
+          if (box.key === "FirstTdAgainstPct") {
+            const ft = computeFirstTakedownStats(w.id);
+            if (ft.contests >= 1) {
+              const pct = Math.round((ft.oppFirst / ft.contests) * 100);
+              leaders.push({ ...w, val: pct, displayVal: pct + "% (" + ft.oppFirst + "/" + ft.contests + ")" });
             }
             return;
           }
@@ -11469,7 +11663,7 @@
               <div class="sec-label">${swEsc(box.label)}</div>
               ${box.expandable ? `<span style="font-size:10px; color:var(--muted);">${expanded ? '▲ collapse' : '▼ expand'}</span>` : ''}
             </div>
-            ${buildLeaderboardPodium(leaders, isOff ? 'var(--green)' : 'var(--red)', (box.key === 'ShotPct' || box.key === 'FirstTdPct') ? 'pct' : null)}
+            ${buildLeaderboardPodium(leaders, isOff ? 'var(--green)' : 'var(--red)', (box.key === 'ShotPct' || box.key === 'FirstTdPct' || box.key === 'FirstTdAgainstPct') ? 'pct' : null)}
             ${detailHtml}
           </div>
         `;
@@ -11745,8 +11939,19 @@ function computeRawStatsBundle(wrestlerId) {
           rtAvgNfPinFmt = rt.fmt(rt.avgOurPerNfOrPin || 0);
         }
       } catch (e) {}
+      let firstTd = 0, firstTdAgainst = 0, firstTdPct = null, firstTdContests = 0;
+      try {
+        const ft = typeof computeFirstTakedownStats === "function"
+          ? computeFirstTakedownStats(wrestlerId || null)
+          : { ourFirst: 0, oppFirst: 0, pct: null, contests: 0 };
+        firstTd = ft.ourFirst || 0;
+        firstTdAgainst = ft.oppFirst || 0;
+        firstTdPct = ft.pct;
+        firstTdContests = ft.contests || 0;
+      } catch (e) {}
       return { wins, losses, ties, winForfeit, lossForfeit, winOt, lossOt, winPct, shotSuccess, shotTaken, shotPct,
-        td, tdAgainst, nf2, nf3, nf4, nf5, nf2a, nf3a, nf4a, nf5a, rev, revA, esc, escA, rtPtsEarned, rtPtsAgainst, penAwarded, penGiven,
+        td, tdAgainst, firstTd, firstTdAgainst, firstTdPct, firstTdContests,
+        nf2, nf3, nf4, nf5, nf2a, nf3a, nf4a, nf5a, rev, revA, esc, escA, rtPtsEarned, rtPtsAgainst, penAwarded, penGiven,
         winPin, lossPin, winTech, lossTech, winMajor, lossMajor, winDec, lossDec, teamPts, teamPtsAgainst,
         choiceTop, choiceBottom, choiceNeutral, choiceDefer, prof, profTop, profBottom, profNeutral,
         rtTotalFmt, rtAvgMatchFmt, rtAvgOppFmt, rtAvgNfPinFmt };
@@ -11812,6 +12017,8 @@ function computeRawStatsBundle(wrestlerId) {
         line("Shot %", shotStr, "shotPct"),
         line("Takedowns", b.td, "td"),
         line("Takedowns against", b.tdAgainst, "tdAgainst", false),
+        line("1st Takedowns", b.firstTd || 0, "firstTd"),
+        line("1st Takedown %", (b.firstTdPct == null ? "—" : (b.firstTdPct + "% (" + (b.firstTd || 0) + "/" + (b.firstTdContests || 0) + ")")), "firstTdPct"),
         line("NF2", b.nf2, "nf2"),
         line("NF3", b.nf3, "nf3"),
         line("NF4", b.nf4, "nf4"),
@@ -12463,6 +12670,8 @@ function computeRawStatsBundle(wrestlerId) {
       const categoryBoxes = isOff
         ? [
             { key: "Takedown", label: "Takedowns (T3)" },
+            { key: "FirstTd", label: "1st Takedowns" },
+            { key: "FirstTdPct", label: "1st Takedown %" },
             { key: "Escape", label: "Escapes (E1)" },
             { key: "Reversal", label: "Reversals (R2)" },
             { key: "Near Fall / Pin", label: "Near Fall Exposures" },
@@ -12472,6 +12681,8 @@ function computeRawStatsBundle(wrestlerId) {
           ]
         : [
             { key: "Takedown", label: "Takedowns Scored On" },
+            { key: "FirstTdAgainst", label: "1st Takedowns" },
+            { key: "FirstTdAgainstPct", label: "1st Takedown %" },
             { key: "Escape", label: "Escapes Allowed" },
             { key: "Reversal", label: "Reversals Allowed" },
             { key: "Near Fall / Pin", label: "Near Falls Scored On" },
@@ -13263,6 +13474,61 @@ function computeRawStatsBundle(wrestlerId) {
 
 
     /* ========== CALENDAR & ATTENDANCE ========== */
+    /** US fixed + floating holidays keyed by MM-DD for a given year. */
+    function nthWeekdayOfMonth(year, monthIndex0, weekday, n) {
+      // weekday: 0=Sun..6=Sat; n: 1-based occurrence
+      let count = 0;
+      for (let d = 1; d <= 31; d++) {
+        const dt = new Date(year, monthIndex0, d);
+        if (dt.getMonth() !== monthIndex0) break;
+        if (dt.getDay() === weekday) {
+          count++;
+          if (count === n) return d;
+        }
+      }
+      return null;
+    }
+    function lastWeekdayOfMonth(year, monthIndex0, weekday) {
+      const last = new Date(year, monthIndex0 + 1, 0).getDate();
+      for (let d = last; d >= 1; d--) {
+        const dt = new Date(year, monthIndex0, d);
+        if (dt.getDay() === weekday) return d;
+      }
+      return null;
+    }
+    function getUsHolidaysForYear(year) {
+      const y = Number(year) || new Date().getFullYear();
+      const pad = (n) => String(n).padStart(2, "0");
+      const md = (m, d) => pad(m) + "-" + pad(d);
+      const map = {
+        "01-01": "New Year's Day",
+        "06-19": "Juneteenth",
+        "07-04": "Independence Day",
+        "11-11": "Veterans Day",
+        "12-24": "Christmas Eve",
+        "12-25": "Christmas",
+        "12-31": "New Year's Eve"
+      };
+      const mlk = nthWeekdayOfMonth(y, 0, 1, 3); // 3rd Monday Jan
+      if (mlk) map[md(1, mlk)] = "Martin Luther King Jr. Day";
+      const presidents = nthWeekdayOfMonth(y, 1, 1, 3); // 3rd Monday Feb
+      if (presidents) map[md(2, presidents)] = "Presidents' Day";
+      const memorial = lastWeekdayOfMonth(y, 4, 1); // last Monday May
+      if (memorial) map[md(5, memorial)] = "Memorial Day";
+      const labor = nthWeekdayOfMonth(y, 8, 1, 1); // 1st Monday Sep
+      if (labor) map[md(9, labor)] = "Labor Day";
+      const columbus = nthWeekdayOfMonth(y, 9, 1, 2); // 2nd Monday Oct
+      if (columbus) map[md(10, columbus)] = "Columbus Day / Indigenous Peoples' Day";
+      const thanks = nthWeekdayOfMonth(y, 10, 4, 4); // 4th Thursday Nov
+      if (thanks) map[md(11, thanks)] = "Thanksgiving";
+      // Day after Thanksgiving (common school holiday)
+      if (thanks) {
+        const next = thanks + 1;
+        if (next <= 30) map[md(11, next)] = "Day after Thanksgiving";
+      }
+      return map;
+    }
+
     let calendarActiveMonth = null; // "YYYY-MM"
     let calendarSelectedDate = null; // "YYYY-MM-DD"
     let calendarAttDivisionFilter = "Both"; // Boys | Girls | Both — which wrestlers show in the attendance list
@@ -13552,10 +13818,12 @@ function computeRawStatsBundle(wrestlerId) {
       }
 
       const monthNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-      const holidays = {
-        "01-01": "New Year's Day", "07-04": "Independence Day", "12-25": "Christmas",
-        "12-24": "Christmas Eve", "12-31": "New Year's Eve", "11-11": "Veterans Day"
-      };
+      const holidays = (typeof getUsHolidaysForYear === "function" && year)
+        ? getUsHolidaysForYear(year)
+        : {
+            "01-01": "New Year's Day", "07-04": "Independence Day", "12-25": "Christmas",
+            "12-24": "Christmas Eve", "12-31": "New Year's Eve", "11-11": "Veterans Day"
+          };
 
       let gridHtml = "";
       if (ym) {
@@ -13580,7 +13848,10 @@ function computeRawStatsBundle(wrestlerId) {
                 ${sum.hasAtt ? `<span style="color:var(--gold); font-size:9px; text-align:right;">${swEsc(sum.label)}</span>` : ""}
               </div>
               ${hol ? `<div style="font-size:9px; color:var(--red);">${swEsc(hol)}</div>` : ""}
-              ${bouts.map(b => `<div style="font-size:9px; color:${boutColor(b)}; font-weight:700;">${swEsc(b.type)}: ${swEsc(b.opponentTeam || "")}</div>`).join("")}
+              ${bouts.map(b => {
+                const homeTag = (String(b.homeAway || "Home") === "Home") ? " (Home)" : (String(b.homeAway) === "Away" ? " (Away)" : (String(b.homeAway) === "Neutral" ? " (Neutral)" : ""));
+                return `<div style="font-size:9px; color:${boutColor(b)}; font-weight:700;">${swEsc(b.type)}: ${swEsc(b.opponentTeam || "")}${swEsc(homeTag)}</div>`;
+              }).join("")}
               ${customs.map(c => `<div style="font-size:9px; color:var(--chalk);">${swEsc(c.title)}</div>`).join("")}
             </div>`);
         }
@@ -15266,6 +15537,62 @@ const aiBody = `
         return;
       }
 
+      if (activeModal === "io-connect-drive") {
+        const signed = (typeof isGoogleSignedIn === "function" && isGoogleSignedIn());
+        root.innerHTML = `
+          <div class="modal-overlay" onclick="closeModal()">
+            <div class="modal-box" onclick="event.stopPropagation()" style="max-width:520px;">
+              <div class="card-title">Google Drive connection</div>
+              <div style="margin:0 0 10px 0;">
+                ${signed
+                  ? `<span class="sw-status-pill sw-status-on"><span class="sw-status-dot"></span>Connected${googleUserEmail ? (" · " + swEsc(googleUserEmail)) : ""}</span>`
+                  : `<span class="sw-status-pill sw-status-off"><span class="sw-status-dot"></span>Not connected</span>`}
+              </div>
+              <p style="font-size:11px; color:var(--muted); margin:0 0 8px 0;">Same controls as Admin → Season &amp; Storage → Google Drive team sync.</p>
+              <label class="field-label">Google OAuth Client ID</label>
+              <input class="input" style="margin-bottom:8px;" placeholder="xxxx.apps.googleusercontent.com"
+                value="${swEsc(appConfig.googleClientId || '')}"
+                onchange="appConfig.googleClientId = this.value.trim(); persist();" />
+              <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;">
+                <button type="button" class="btn btn-green" style="font-size:11px;" onclick="connectGoogleDrive().then(function(){ try{updateIoLocationBadges();}catch(e){} renderModal(); }).catch(function(){})">Connect Google</button>
+                <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="disconnectGoogleDrive(); renderModal();">Disconnect</button>
+                <button type="button" class="btn btn-gold" style="font-size:11px;" onclick="ensureGoogleDriveFolderStructure().then(function(){ renderModal(); }).catch(function(){})">Create / verify folders</button>
+              </div>
+              <p style="font-size:10px; color:var(--muted); margin:0 0 4px 0;"><strong style="color:var(--gold);">Backups folder:</strong> ${swEsc(appConfig.googleDriveFolderName || "Not set")}</p>
+              <p style="font-size:10px; color:var(--muted); margin:0 0 12px 0;"><strong style="color:var(--gold);">Root:</strong> ${swEsc(appConfig.googleDriveRootFolderName || "Not set")}</p>
+              <div class="modal-actions">
+                <button class="btn" style="background:var(--panelLine); color:var(--chalk);" onclick="closeModal(); try{updateIoLocationBadges();}catch(e){}">Close</button>
+              </div>
+            </div>
+          </div>`;
+        return;
+      }
+
+      if (activeModal === "io-connect-local") {
+        const lOn = (typeof localSwRootHandle !== "undefined" && !!localSwRootHandle);
+        const localName = lOn ? (localSwRootHandle.name || "Linked folder") : "Not set";
+        root.innerHTML = `
+          <div class="modal-overlay" onclick="closeModal()">
+            <div class="modal-box" onclick="event.stopPropagation()" style="max-width:480px;">
+              <div class="card-title">Local folder connection</div>
+              <div style="margin:0 0 10px 0;">
+                ${lOn
+                  ? `<span class="sw-status-pill sw-status-on"><span class="sw-status-dot"></span>Local folder ready · ${swEsc(localName)}</span>`
+                  : `<span class="sw-status-pill sw-status-off"><span class="sw-status-dot"></span>Local folder not set</span>`}
+              </div>
+              <p style="font-size:11px; color:var(--muted); margin:0 0 10px 0;">Same controls as Admin → Season &amp; Storage. Choose a parent folder; the app uses Strategic Wrestler / Backups under it.</p>
+              <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px;">
+                <button type="button" class="btn btn-green" style="font-size:11px;" onclick="pickLocalSwRootFolder().then(function(){ try{updateIoLocationBadges();}catch(e){} renderModal(); }).catch(function(){})">Choose local folder</button>
+                <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="clearLocalSwRootFolder(); try{updateIoLocationBadges();}catch(e){} renderModal();">Clear local folder</button>
+              </div>
+              <div class="modal-actions">
+                <button class="btn" style="background:var(--panelLine); color:var(--chalk);" onclick="closeModal(); try{updateIoLocationBadges();}catch(e){}">Close</button>
+              </div>
+            </div>
+          </div>`;
+        return;
+      }
+
       if (activeModal === "ruleset") {
         const r = (typeof getActiveRuleset === "function") ? getActiveRuleset() : null;
         const detail = (typeof getRulesetDetailHtml === "function") ? getRulesetDetailHtml(r) : "<p>Rules unavailable.</p>";
@@ -15289,8 +15616,13 @@ const aiBody = `
             <div class="modal-box" onclick="event.stopPropagation()">
               <div class="card-title">Report Bug / Request Feature</div>
               <p style="font-size:12px; color:var(--muted); margin-bottom:10px;">
-                Choose Bug or Feature, describe it, then Submit. It is filed on the Strategic Wrestler GitHub Issues tracker with the matching label.
+                Choose the product and whether this is a bug or a feature request, then Submit. Issues are filed on GitHub with the matching label (bug or enhancement).
               </p>
+              <label class="field-label">Product</label>
+              <select id="bug-report-product" class="select" style="margin-bottom:8px;">
+                <option value="Strategic Wrestler" selected>Strategic Wrestler</option>
+                <option value="MatSide">MatSide</option>
+              </select>
               <label class="field-label">Type</label>
               <select id="bug-report-type" class="select" style="margin-bottom:8px;">
                 <option value="bug" selected>Bug</option>
@@ -17840,12 +18172,29 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
               return;
             }
             googleAccessToken = resp.access_token;
+            try {
+              const expiresIn = Number(resp.expires_in) || 3600;
+              // Refresh ~5 minutes before expiry so Drive never "times out" mid-session
+              window.__swGoogleTokenExpiresAt = Date.now() + (expiresIn * 1000);
+              if (window.__swGoogleTokenRefreshTimer) clearTimeout(window.__swGoogleTokenRefreshTimer);
+              const refreshIn = Math.max(60 * 1000, (expiresIn - 300) * 1000);
+              window.__swGoogleTokenRefreshTimer = setTimeout(function () {
+                try {
+                  requestGoogleAccessToken("").then(function () {
+                    try { updateIoLocationBadges(); } catch (e2) {}
+                  }).catch(function () {
+                    // silent failure — next Drive call will prompt if needed
+                  });
+                } catch (e3) {}
+              }, refreshIn);
+            } catch (e) {}
             // Best-effort email
             fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
               headers: { Authorization: "Bearer " + googleAccessToken }
             }).then(r => r.ok ? r.json() : null).then(u => {
               if (u && u.email) googleUserEmail = u.email;
               try { render(); } catch (e) {}
+              try { updateIoLocationBadges(); } catch (e) {}
             }).catch(() => {});
             resolve(googleAccessToken);
           };
@@ -17874,12 +18223,19 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       }
       googleAccessToken = null;
       googleUserEmail = "";
+      try {
+        window.__swGoogleTokenExpiresAt = 0;
+        if (window.__swGoogleTokenRefreshTimer) { clearTimeout(window.__swGoogleTokenRefreshTimer); window.__swGoogleTokenRefreshTimer = null; }
+      } catch (e) {}
       toast("Google disconnected on this device.", "info");
+      try { updateIoLocationBadges(); } catch (e) {}
       render();
     }
 
     async function ensureGoogleToken() {
-      if (googleAccessToken) return googleAccessToken;
+      const exp = window.__swGoogleTokenExpiresAt || 0;
+      const nearlyExpired = exp && Date.now() > (exp - 120000);
+      if (googleAccessToken && !nearlyExpired) return googleAccessToken;
       return requestGoogleAccessToken("");
     }
 
@@ -17893,10 +18249,12 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       if (res.status === 401 || res.status === 403) {
         // retry once with fresh consent
         googleAccessToken = null;
+        try { updateIoLocationBadges(); } catch (e) {}
         const token2 = await requestGoogleAccessToken("consent");
         opts.headers.Authorization = "Bearer " + token2;
         const res2 = await fetch("https://www.googleapis.com/drive/v3" + path, opts);
         if (!res2.ok) throw new Error(await res2.text());
+        try { updateIoLocationBadges(); } catch (e) {}
         return res2;
       }
       if (!res.ok) throw new Error((await res.text()) || res.statusText);
@@ -18304,6 +18662,17 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     function setDownloadTargetFromBadge(target) {
       const t = (target === "local") ? "local" : "drive";
       if (!appConfig) return;
+      const gOn = (typeof isGoogleSignedIn === "function" && isGoogleSignedIn());
+      const lOn = (typeof localSwRootHandle !== "undefined" && !!localSwRootHandle);
+      // Red / disconnected: open connection popup with Admin-equivalent controls
+      if (t === "drive" && !gOn) {
+        try { activeModal = "io-connect-drive"; renderModal(); } catch (e) {}
+        return;
+      }
+      if (t === "local" && !lOn) {
+        try { activeModal = "io-connect-local"; renderModal(); } catch (e) {}
+        return;
+      }
       appConfig.downloadTarget = t;
       try { persist(); } catch (e) {}
       try { updateIoLocationBadges(); } catch (e) {}
@@ -18342,11 +18711,13 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       const titleEl = document.getElementById("bug-report-title");
       const bodyEl = document.getElementById("bug-report-body");
       const typeEl = document.getElementById("bug-report-type");
+      const productEl = document.getElementById("bug-report-product");
       const title = ((titleEl && titleEl.value) || "").trim();
       const body = ((bodyEl && bodyEl.value) || "").trim();
       const reportType = (typeEl && typeEl.value === "feature") ? "feature" : "bug";
       const typeLabel = reportType === "feature" ? "Feature request" : "Bug";
       const githubLabel = reportType === "feature" ? "enhancement" : "bug";
+      const product = (productEl && productEl.value) ? productEl.value : "Strategic Wrestler";
       if (!title && !body) {
         try { toast("Enter a short title or description.", "error"); } catch (e) {}
         return;
@@ -18357,22 +18728,25 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       const email = (typeof googleUserEmail === "string" && googleUserEmail) ? googleUserEmail : "";
       const lic = (typeof ensureLicenseState === "function") ? ensureLicenseState() : null;
       const payload = {
-        title: (reportType === "feature" ? "[Feature] " : "[Bug] ") + (title || "SW report"),
+        title: title || (product + " " + (reportType === "feature" ? "feature request" : "bug report")),
         body: body || "(no description)",
         reportType: reportType,
         label: githubLabel,
+        product: product,
         build: build,
         url: (typeof location !== "undefined" ? location.href : ""),
         userAgent: (typeof navigator !== "undefined" ? navigator.userAgent : ""),
         googleEmail: email || "",
         license: lic && lic.activated ? (lic.licensedEmail || "activated") : "trial/not activated",
         saveTarget: (appConfig && appConfig.downloadTarget) || "drive",
-        repo: (typeof SW_BUG_REPORT_GITHUB_REPO !== "undefined" ? SW_BUG_REPORT_GITHUB_REPO : "CannonFodderrr/Strategic-Wrestler")
+        repo: (product === "MatSide"
+          ? (typeof MATSIDE_BUG_REPORT_GITHUB_REPO !== "undefined" ? MATSIDE_BUG_REPORT_GITHUB_REPO : "CannonFodderrr/Mat-Scorer")
+          : (typeof SW_BUG_REPORT_GITHUB_REPO !== "undefined" ? SW_BUG_REPORT_GITHUB_REPO : "CannonFodderrr/Strategic-Wrestler"))
       };
       try {
         if (typeof supabaseConfigured === "function" && supabaseConfigured()) {
-          const base = getSupabaseUrl();
-          const key = getSupabaseKey();
+          const base = String(appConfig.supabaseUrl || "").replace(/\/$/, "");
+          const key = String(appConfig.supabaseAnonKey || "").trim();
           const res = await fetch(base + "/functions/v1/report-bug", {
             method: "POST",
             headers: {
@@ -18391,8 +18765,8 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           const issueUrl = data && (data.html_url || data.url);
           try {
             toast(issueUrl
-              ? (typeLabel + " filed on GitHub: " + issueUrl)
-              : (typeLabel + " submitted to GitHub Issues."), "success", 8000);
+              ? (product + " · " + typeLabel + " filed: " + issueUrl)
+              : (product + " · " + typeLabel + " submitted to GitHub."), "success", 8000);
           } catch (e) {}
           closeModal();
           return;
@@ -18403,11 +18777,12 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         try {
           let repo = String(payload.repo || "").trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "").replace(/\/$/, "");
           const meta = [
-            "### " + typeLabel + " (Strategic Wrestler)",
+            "### " + typeLabel + " — " + product,
             "",
             payload.body,
             "",
             "---",
+            "- **Product:** " + product,
             "- **Type:** " + typeLabel,
             "- **Build:** " + payload.build,
             "- **URL:** " + payload.url,
@@ -19000,6 +19375,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         if (target === "local") appConfig.downloadTarget = "local";
         try {
           await downloadOrDriveExport(fname, body, "application/json", "backup");
+          try { await pruneOldBackupsIfEnabled(target); } catch (pe) { console.warn("backup prune", pe); }
         } finally {
           appConfig.downloadTarget = prev;
         }
@@ -19011,8 +19387,62 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       }
     }
 
+    async function pruneOldBackupsIfEnabled(target) {
+      if (!appConfig || appConfig.pruneBackupsAfter5Days === false) return;
+      const cutoff = Date.now() - (5 * 24 * 60 * 60 * 1000);
+      let removed = 0;
+      if (target === "drive" && typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
+        try {
+          const files = await listDriveBackups();
+          for (const f of files) {
+            const t = Date.parse(f.modifiedTime || 0);
+            if (!t || t >= cutoff) continue;
+            const name = String(f.name || "");
+            if (!/backup|strategic-wrestler|mat-scout/i.test(name)) continue;
+            try {
+              await driveFetch("/files/" + encodeURIComponent(f.id), { method: "DELETE" });
+              removed++;
+            } catch (e) { console.warn("prune drive file", f.name, e); }
+          }
+        } catch (e) { console.warn("prune drive list", e); }
+      }
+      if (target === "local" && typeof localSwRootHandle !== "undefined" && localSwRootHandle) {
+        try {
+          let backupsDir = localSwRootHandle;
+          try {
+            backupsDir = await localSwRootHandle.getDirectoryHandle("Backups", { create: false });
+          } catch (e) {
+            try {
+              const sw = await localSwRootHandle.getDirectoryHandle("Strategic Wrestler", { create: false });
+              backupsDir = await sw.getDirectoryHandle("Backups", { create: false });
+            } catch (e2) { backupsDir = null; }
+          }
+          if (backupsDir && backupsDir.values) {
+            const toDelete = [];
+            for await (const entry of backupsDir.values()) {
+              if (entry.kind !== "file") continue;
+              const n = entry.name || "";
+              if (!/\.json$/i.test(n)) continue;
+              if (!/backup|strategic-wrestler|mat-scout/i.test(n)) continue;
+              try {
+                const file = await entry.getFile();
+                if (file.lastModified && file.lastModified < cutoff) toDelete.push(entry.name);
+              } catch (e) {}
+            }
+            for (const name of toDelete) {
+              try { await backupsDir.removeEntry(name); removed++; } catch (e) {}
+            }
+          }
+        } catch (e) { console.warn("prune local", e); }
+      }
+      if (removed > 0) {
+        try { toast("Removed " + removed + " backup(s) older than 5 days.", "info", 4000); } catch (e) {}
+      }
+    }
+
     async function loadSharedSeasonData() {
       try {
+        if (typeof guardPresenceEdit === "function" && guardPresenceEdit("Load backup")) return;
         const target = resolveIoTarget("Load");
         if (target == null) return;
         if (target === "drive") {
@@ -19718,6 +20148,69 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         renderModal();
       }
     }
+
+    function printSeasonMatchLedger() {
+      const table = document.getElementById("season-match-ledger-table");
+      if (!table) {
+        try { toast("Ledger table not found.", "error"); } catch (e) {}
+        return;
+      }
+      const season = (typeof getActiveSeason === "function") ? getActiveSeason() : null;
+      const activeW = (typeof getActiveWrestler === "function") ? getActiveWrestler() : null;
+      const team = (typeof branding !== "undefined" && branding && branding.teamName) ? branding.teamName : "Strategic Wrestler";
+      const title = "Season Match Ledger";
+      const sub = [
+        team,
+        season && season.name ? season.name : "",
+        activeW ? (activeW.name + " · " + (activeW.weightClass || "") + " lbs") : "All athletes"
+      ].filter(Boolean).join(" · ");
+      const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${title}</title>
+        <style>
+          body { font-family: system-ui, sans-serif; color: #111; padding: 16px; }
+          h1 { font-size: 18px; margin: 0 0 4px 0; }
+          .sub { font-size: 12px; color: #444; margin-bottom: 12px; }
+          table { width: 100%; border-collapse: collapse; font-size: 11px; }
+          th, td { border: 1px solid #777; padding: 6px 8px; text-align: left; }
+          th { background: #e5e7eb; text-transform: uppercase; font-size: 10px; }
+          tr:nth-child(even) { background: #f9fafb; }
+          @media print { body { padding: 0; } }
+        </style></head><body>
+        <h1>${title}</h1>
+        <div class="sub">${sub} · Printed ${new Date().toLocaleString()}</div>
+        ${table.outerHTML}
+        </body></html>`;
+
+      // Hidden iframe avoids popup blockers (window.open is often blocked on localhost)
+      try {
+        const prev = document.getElementById("sw-print-iframe");
+        if (prev) prev.remove();
+        const iframe = document.createElement("iframe");
+        iframe.id = "sw-print-iframe";
+        iframe.setAttribute("aria-hidden", "true");
+        iframe.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;pointer-events:none;";
+        document.body.appendChild(iframe);
+        const idoc = iframe.contentDocument || iframe.contentWindow.document;
+        idoc.open();
+        idoc.write(html);
+        idoc.close();
+        const doPrint = () => {
+          try {
+            iframe.contentWindow.focus();
+            iframe.contentWindow.print();
+          } catch (e) {
+            console.warn(e);
+            try { toast("Could not open print dialog.", "error"); } catch (e2) {}
+          }
+          setTimeout(() => { try { iframe.remove(); } catch (e3) {} }, 2000);
+        };
+        // Allow layout/paint before print
+        setTimeout(doPrint, 250);
+      } catch (err) {
+        console.warn(err);
+        try { toast("Print failed: " + (err.message || err), "error"); } catch (e) {}
+      }
+    }
+
 
     function openChangelogModal() {
       activeModal = "changelog";
