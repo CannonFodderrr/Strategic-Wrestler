@@ -1,0 +1,16 @@
+Strategic Wrestler folder layout
+================================
+
+Strategic Wrestler/
+  indexSW.html                 ← program (auto-updated from GitHub Releases)
+  update_and_serve.py          ← checks GitHub, serves localhost:2231
+  version.txt                  ← last installed release tag
+  Start Strategic Wrestler.bat
+  Start Strategic Wrestler.command
+  Start Strategic Wrestler.sh
+  GITHUB-RELEASES-HOWTO.txt    ← for the publisher (you)
+
+Optional local data folders (File System Access / defaults):
+  Strategic Wrestler/Backups/
+  Strategic Wrestler/Exports/
+  ...

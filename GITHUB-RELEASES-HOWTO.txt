@@ -1,0 +1,132 @@
+Strategic Wrestler — How to publish updates on GitHub
+=====================================================
+
+Repo:  https://github.com/CannonFodderrr/Strategic-Wrestler
+
+Until now you may have only pushed changes to the "main" branch.
+The launcher does NOT read main for updates.
+It reads the latest GitHub RELEASE and downloads the indexSW.html
+you attach to that release.
+
+Do this every time you ship a new SW build.
+
+
+----------------------------------------------------------
+ONE-TIME SETUP
+----------------------------------------------------------
+
+1. Repo should be Public (easiest / free)
+   - GitHub → your repo → Settings → General → Danger Zone
+   - Or keep Private and use a token later (more advanced)
+
+2. Make sure Issues are enabled (you already use these for bugs)
+
+3. Coaches need these files in ONE folder:
+     indexSW.html
+     update_and_serve.py
+     version.txt          (optional; created automatically after first update)
+     Start Strategic Wrestler.bat      (Windows)
+     Start Strategic Wrestler.command  (Mac)
+     Start Strategic Wrestler.sh       (Linux / Chromebook Linux)
+
+4. Google OAuth origin still:
+     http://localhost:2231
+
+
+----------------------------------------------------------
+EVERY TIME YOU RELEASE AN UPDATE (step by step)
+----------------------------------------------------------
+
+A. Finish your HTML
+   - Save the new indexSW.html on your computer
+   - (Optional) also commit/push it to main for backup — that does
+     NOT update coaches by itself
+
+B. Create a Release on GitHub
+   1. Open: https://github.com/CannonFodderrr/Strategic-Wrestler
+   2. Click "Releases" (right side of the repo page)
+      If you do not see it:  Code tab → right sidebar → Releases → "Create a new release"
+   3. Click "Draft a new release"
+   4. Choose a tag:
+        - Click "Choose a tag"
+        - Type a NEW tag name, for example:  v2026.10.02
+        - Click "Create new tag: v2026.10.02 on publish"
+      Tip: use date or build id. Newer tags should sort "greater"
+           (v2026.10.03 after v2026.10.02).
+   5. Release title: e.g.  Strategic Wrestler 2026.10.02
+   6. Description: short notes for yourself / coaches
+        (What's new, bug fixes, etc.)
+   7. IMPORTANT — Attach the HTML file:
+        - Drag and drop indexSW.html into "Attach binaries"
+          OR click "Attaching binaries" and select the file
+        - The file name should be exactly:  indexSW.html
+   8. Leave "Set as the latest release" checked
+   9. Click "Publish release"
+
+C. Test on your machine
+   1. Put an older version.txt in your SW folder (or delete version.txt)
+   2. Run Start Strategic Wrestler
+   3. The black/terminal window should say it downloaded the new tag
+   4. Browser opens http://localhost:2231/indexSW.html
+
+
+----------------------------------------------------------
+WHAT COACHES SEE
+----------------------------------------------------------
+
+  Local version:  v2026.10.01
+  Latest release: v2026.10.02
+  Downloading indexSW.html …
+  Updated indexSW.html → v2026.10.02
+  Starting local server …
+
+Season data is NOT inside indexSW.html. Drive / local backups stay.
+
+
+----------------------------------------------------------
+OFFLINE / SKIP UPDATE
+----------------------------------------------------------
+
+  Windows (Command Prompt in the SW folder):
+    py -3 update_and_serve.py --offline
+
+  Or set environment variable SW_SKIP_UPDATE=1
+
+  If GitHub is unreachable, the launcher still starts the existing HTML.
+
+
+----------------------------------------------------------
+COMMON MISTAKES
+----------------------------------------------------------
+
+  "I pushed to main but coaches did not update"
+    → You must Publish a Release and attach indexSW.html
+
+  "Download failed HTTP 404"
+    → The release has no indexSW.html asset. Edit the release and
+      upload the file, or make a new release.
+
+  "Already up to date" but file looks old
+    → Delete version.txt once, or publish a newer tag name
+
+  Port already in use
+    → Close the other SW window, or change PORT in update_and_serve.py
+
+
+----------------------------------------------------------
+PRIVATE REPO (optional later)
+----------------------------------------------------------
+
+  Unauthenticated API cannot read private releases.
+  Options: make repo public, or add a read-only token into the
+  launcher (advanced; do not put write tokens in coach files).
+
+
+----------------------------------------------------------
+SUMMARY
+----------------------------------------------------------
+
+  main branch  = your working copy / history
+  Releases     = what coaches automatically download
+
+  Ship update = new tag + attach indexSW.html + Publish release
