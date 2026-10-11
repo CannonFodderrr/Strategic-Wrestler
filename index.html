@@ -792,12 +792,18 @@
     /** MatSide issues go here (change if your MatSide repo path differs). */
     const MATSIDE_BUG_REPORT_GITHUB_REPO = "CannonFodderrr/Mat-Scorer";
     /**
-     * Supabase license server. Fill in your project URL and anon/publishable key
-     * (the anon key is public by design; never use the service_role key here).
-     * When set, these are authoritative and the Admin override fields are hidden.
+     * Supabase license server (hosted by product owner).
+     * The anon key is public by design; never put the service_role key here.
+     * When set, Admin override fields for URL/key are hidden.
      */
-    const SW_SUPABASE_URL = "";
-    const SW_SUPABASE_ANON_KEY = "";
+    const SW_SUPABASE_URL = "https://ciyvrxalftmzkbbdckci.supabase.co";
+    const SW_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNpeXZyeGFsZnRtemtiYmRja2NpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA3MjAzOTQsImV4cCI6MjEwNjI5NjM5NH0.66NHIml6FiVwNdgHJtOAVzPEsHlKf1QUCP0k4hWxrHk";
+    /**
+     * Google OAuth Web Client ID (same project for all schools).
+     * When set, Admin Client ID field is pre-filled / treated as built-in.
+     * Google Cloud → Credentials must list every origin coaches open the app from.
+     */
+    const SW_GOOGLE_CLIENT_ID = "672071758154-n3sa4reeei7aq44ud7ntlk6bnren06j3.apps.googleusercontent.com";
     /** How often to re-check the license online, and how long an offline device is trusted. */
     const LICENSE_RECHECK_MS = 6 * 60 * 60 * 1000;          // 6 hours
     const LICENSE_OFFLINE_GRACE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
@@ -4247,6 +4253,32 @@
       setTimeout(function () {
         try { startPresenceSystem(); } catch (e) {}
       }, 2500);
+    } catch (e) {}
+
+    /** Soft Google Drive connect on launch: reuse existing Google session without a consent wall when possible. */
+    function tryAutoConnectGoogleDrive() {
+      try {
+        if (!googleClientId()) return;
+        if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
+          try { updateIoLocationBadges(); } catch (e) {}
+          return;
+        }
+        // prompt "" = silent if browser already has a Google session for this client
+        requestGoogleAccessToken("").then(function () {
+          try { updateIoLocationBadges(); } catch (e) {}
+          try {
+            if (typeof ensureGoogleDriveFolderStructure === "function" && !(appConfig.googleDriveFolderId || "").trim()) {
+              // Do not auto-create folders without consent; badge stays ready for Save
+            }
+          } catch (e2) {}
+        }).catch(function () {
+          // First visit or blocked popup — user can Connect from Admin / G badge
+          try { updateIoLocationBadges(); } catch (e3) {}
+        });
+      } catch (e) {}
+    }
+    try {
+      setTimeout(function () { tryAutoConnectGoogleDrive(); }, 1800);
     } catch (e) {}
 
     /**
@@ -14356,12 +14388,16 @@ const teamOpsBody = `
               ${typeof googleAuthStatusText === "function" ? googleAuthStatusText() : ""}
             </p>
             <label class="field-label">Google OAuth Client ID (Web application)</label>
-            <input class="input" style="margin-bottom:6px;" placeholder="123456789-xxxx.apps.googleusercontent.com"
+            ${(typeof SW_GOOGLE_CLIENT_ID === "string" && SW_GOOGLE_CLIENT_ID)
+              ? `<p style="font-size:11px; color:var(--muted); margin:0 0 8px 0;">Built into this build · <code style="font-size:10px;">${swEsc(SW_GOOGLE_CLIENT_ID.slice(0, 28))}…</code></p>`
+              : `<input class="input" style="margin-bottom:6px;" placeholder="123456789-xxxx.apps.googleusercontent.com"
               value="${swEsc(appConfig.googleClientId || '')}"
-              onchange="appConfig.googleClientId = this.value.trim(); persist();" />
+              onchange="appConfig.googleClientId = this.value.trim(); persist();" />`}
             <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">
-              Create a Client ID in Google Cloud Console → APIs &amp; Services → Credentials.
-              Enable <strong>Google Drive API</strong>. Under Authorized JavaScript origins, add the origin you open Strategic Wrestler from
+              ${(typeof SW_GOOGLE_CLIENT_ID === "string" && SW_GOOGLE_CLIENT_ID)
+                ? `Product OAuth client is configured for all schools. In Google Cloud, Authorized JavaScript origins must include every URL coaches use to open the app.`
+                : `Create a Client ID in Google Cloud Console → APIs &amp; Services → Credentials.
+              Enable <strong>Google Drive API</strong>. Under Authorized JavaScript origins, add the origin you open Strategic Wrestler from`}
               (e.g. <code>http://localhost:8080</code>). <code>file://</code> usually will not work — serve the HTML over http.
             </p>
             <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
@@ -18134,7 +18170,8 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     function googleClientId() {
-      return (appConfig.googleClientId || "").trim();
+      const builtIn = (typeof SW_GOOGLE_CLIENT_ID === "string" && SW_GOOGLE_CLIENT_ID) ? SW_GOOGLE_CLIENT_ID.trim() : "";
+      return (builtIn || (appConfig && appConfig.googleClientId) || "").trim();
     }
 
     function isGoogleSignedIn() {
@@ -20226,6 +20263,13 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
     function maybeShowChangelogOnBoot() {
       try {
+        // Seed built-in Google Client ID so Save/Load work without Admin setup
+        try {
+          if (typeof SW_GOOGLE_CLIENT_ID === "string" && SW_GOOGLE_CLIENT_ID && appConfig && !String(appConfig.googleClientId || "").trim()) {
+            appConfig.googleClientId = SW_GOOGLE_CLIENT_ID.trim();
+            try { persist(); } catch (e0) {}
+          }
+        } catch (eSeed) {}
         ensureLicenseState();
         try { revalidateLicense(true); } catch (e) {}
         try { setInterval(function () { revalidateLicense(false); }, LICENSE_RECHECK_MS); } catch (e) {}
