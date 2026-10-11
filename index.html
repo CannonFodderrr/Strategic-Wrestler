@@ -474,6 +474,7 @@
         </div>
         <div style="display:flex; flex-direction:column; align-items:center; gap:2px;">
           <div style="display:flex; gap:6px; align-items:center; justify-content:center;">
+            <button type="button" class="btn btn-toolbar" style="background:var(--panelLine); color:var(--chalk);" onclick="syncLocalFoldersToGoogleDrive()" title="Upload local Strategic Wrestler folders (Backups, Exports, Archives, AI Library, MatSide) to the matching Google Drive folders">Drive Sync</button>
             <button type="button" class="btn btn-gold btn-toolbar" onclick="loadSharedSeasonData()" title="Load full backup (Default Save/Upload Location)">Load</button>
             <button type="button" class="btn btn-green btn-toolbar" onclick="saveSharedSeasonData()" title="Save full backup (Default Save/Upload Location)">Save</button>
           </div>
@@ -804,6 +805,8 @@
      * Google Cloud → Credentials must list every origin coaches open the app from.
      */
     const SW_GOOGLE_CLIENT_ID = "672071758154-n3sa4reeei7aq44ud7ntlk6bnren06j3.apps.googleusercontent.com";
+    /** Local Auto-Clip server (launcher starts this on the same machine). No internet required. */
+    const SW_CLIP_SERVER_URL = "http://localhost:5057";
     /** How often to re-check the license online, and how long an offline device is trusted. */
     const LICENSE_RECHECK_MS = 6 * 60 * 60 * 1000;          // 6 hours
     const LICENSE_OFFLINE_GRACE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
@@ -2134,7 +2137,7 @@
       /** Cap total frames sent to AI across all windows */
       aiMaxFramesTotal: 48,
       autoClipEnabled: false,
-      autoClipServerUrl: "http://localhost:5057",
+      autoClipServerUrl: "http://localhost:5057", // legacy; UI uses SW_CLIP_SERVER_URL
       allowGirlsInBoysEvents: false,
       /** Attendance rate: how many lates equal one absence-equivalent (never double-counts as Abs). 0 = lates ignored in rate. */
       latesPerAbsence: 2,
@@ -2160,8 +2163,9 @@
       /** Preferred Gemini model id (tried first) */
       preferredAiModel: "gemini-3.6-flash",
       downloadTarget: "drive", // local | drive — prefer Drive when connected
-      /** When true, top-bar Save prunes backup JSON files older than 5 days (Drive + local). */
-      pruneBackupsAfter5Days: true,
+      /** When true, top-bar Save keeps only the newest N backup JSON files (Drive + local). */
+      pruneBackupsAfter5Days: true, // legacy key name; means "prune enabled"
+      pruneBackupsKeepCount: 5,
       /** Division pronouns: "boysGirls" (default) or "menWomen" */
       divisionPronouns: "boysGirls",
       /** Phase 4/5 — your hosted Supabase project (customers do not create one) */
@@ -2193,6 +2197,9 @@
     /** Per-school include-on-season-import flags (key → boolean). Default true when missing. */
     let opponentSchoolImportFlags = {};
     let aiTrainingLibrary = []; // ground-truth matches for AI scoring examples
+    let clipServerConnected = false;
+    let clipServerStatusDetail = "";
+    let clipServerLastCheckAt = 0;
 
     // Shared Manual + AI: how to recognize OUR wrestler on film
     let ourWrestlerAppearance = {
@@ -2498,6 +2505,8 @@
             clipSecondsAfter: parsed.clipSecondsAfter ?? 1.5,
             autoClipEnabled: !!parsed.autoClipEnabled,
             autoClipServerUrl: parsed.autoClipServerUrl || "http://localhost:5057",
+            pruneBackupsAfter5Days: parsed.pruneBackupsAfter5Days !== false,
+            pruneBackupsKeepCount: Math.max(1, parseInt(parsed.pruneBackupsKeepCount, 10) || 5),
             allowGirlsInBoysEvents: !!parsed.allowGirlsInBoysEvents,
             latesPerAbsence: (parsed.latesPerAbsence != null ? Number(parsed.latesPerAbsence) : 2),
             countLatesInAttendanceRate: parsed.countLatesInAttendanceRate !== false,
@@ -3073,9 +3082,10 @@
       if (SWDB.lastSavedAt()) h += '<br/>Last disk write: <strong>' + swEsc(new Date(SWDB.lastSavedAt()).toLocaleString()) + '</strong>';
       h += '</div>';
       const pruneOn = appConfig.pruneBackupsAfter5Days !== false;
+      const pruneKeep = Math.max(1, parseInt(appConfig.pruneBackupsKeepCount, 10) || 5);
       h += '<label style="display:flex; align-items:flex-start; gap:8px; margin-top:10px; font-size:11px; color:var(--chalk); cursor:pointer; line-height:1.4;">';
       h += '<input type="checkbox" style="margin-top:2px;" ' + (pruneOn ? 'checked' : '') + ' onchange="appConfig.pruneBackupsAfter5Days = this.checked; persist();" />';
-      h += '<span><strong>Keep only 5 days of top-bar Saves</strong><br/><span style="color:var(--muted);">When checked, older backup JSON files in the Drive/local Backups folder are removed after each Save. Uncheck to keep all saves.</span></span></label>';
+      h += '<span><strong>Keep only the last ' + pruneKeep + ' top-bar Saves</strong><br/><span style="color:var(--muted);">When checked, only the newest ' + pruneKeep + ' backup JSON files are kept in Drive/local Backups after each Save (by date). Uncheck to keep all saves.</span></span></label>';
       h += '<div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;">';
       if (idb) {
         h += '<button class="btn btn-green" style="font-size:11px;" onclick="swSnapshotNow()">Create Snapshot Now</button>';
@@ -9719,12 +9729,148 @@
       }
     }
 
-    /** Fire-and-forget POST of a just-committed match to the local Python clip server.
-     *  Returns a short status string for display; never throws (best-effort). */
+    function getClipServerUrl() {
+      const built = (typeof SW_CLIP_SERVER_URL === "string" && SW_CLIP_SERVER_URL) ? SW_CLIP_SERVER_URL.trim() : "";
+      return (built || "http://localhost:5057").replace(/\/$/, "");
+    }
+
+    function updateClipServerStatusUI() {
+      const pill = document.getElementById("clip-server-pill");
+      const detail = document.getElementById("clip-server-status");
+      const detailText = clipServerStatusDetail || "";
+      if (pill) {
+        if (clipServerConnected) {
+          pill.textContent = "Connected";
+          pill.style.background = "var(--greenDim, rgba(80,180,80,0.2))";
+          pill.style.color = "var(--green)";
+          pill.style.borderColor = "var(--green)";
+        } else {
+          pill.textContent = "Not connected";
+          pill.style.background = "var(--redDim, rgba(180,60,60,0.15))";
+          pill.style.color = "var(--red)";
+          pill.style.borderColor = "var(--red)";
+        }
+      }
+      if (detail) {
+        detail.textContent = detailText;
+        detail.style.color = clipServerConnected ? "var(--green)" : "var(--muted)";
+      }
+    }
+
+    async function connectClipServer() {
+      const statusEl = document.getElementById("clip-server-status");
+      if (statusEl) { statusEl.textContent = "Connecting…"; statusEl.style.color = "var(--muted)"; }
+      const url = getClipServerUrl();
+      try {
+        const resp = await fetch(url + "/health", { method: "GET" });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const data = await resp.json().catch(() => ({}));
+        clipServerConnected = true;
+        clipServerLastCheckAt = Date.now();
+        const bits = [];
+        if (data.status) bits.push(data.status);
+        if (data.clips_dir) bits.push("clips on this PC");
+        if (data.lora || data.predict) bits.push("LoRA ready");
+        clipServerStatusDetail = (bits.length ? bits.join(" · ") : "OK") + " · " + url;
+        updateClipServerStatusUI();
+        try { toast("Clip server connected (" + url + "). Auto-Clip works offline on this computer.", "success", 4500); } catch (e) {}
+        return true;
+      } catch (err) {
+        clipServerConnected = false;
+        clipServerStatusDetail = "Not reachable — start SW launcher with clip server (port 5057). " + (err.message || err);
+        updateClipServerStatusUI();
+        const installHint =
+          "Clip server not reachable at " + url + ".\n\n" +
+          "Usually the SW launcher starts it automatically when dependencies are installed.\n\n" +
+          "One-time install (Terminal in the Strategic Wrestler folder):\n" +
+          "  pip install flask flask-cors\n" +
+          "Also install ffmpeg and add it to your PATH.\n\n" +
+          "Then restart Strategic Wrestler and click Connect again.\n\n" +
+          "Copy install command to clipboard?";
+        try {
+          if (confirm(installHint)) {
+            const cmd = "pip install flask flask-cors";
+            try {
+              await navigator.clipboard.writeText(cmd);
+              toast("Copied: " + cmd + "\nRun it in Terminal, install ffmpeg, restart SW, then Connect.", "success", 8000);
+            } catch (ce) {
+              prompt("Copy this install command:", cmd);
+            }
+          } else {
+            toast("Clip server not reachable. Install flask flask-cors + ffmpeg, restart the launcher, then Connect.", "error", 8000);
+          }
+        } catch (e) {
+          try { toast("Clip server not reachable at " + url + ". Install: pip install flask flask-cors (+ ffmpeg).", "error", 8000); } catch (e2) {}
+        }
+        return false;
+      }
+    }
+
+    function disconnectClipServer() {
+      clipServerConnected = false;
+      clipServerStatusDetail = "Disconnected — Connect when the local clip server is running.";
+      updateClipServerStatusUI();
+      try { toast("Clip server marked disconnected. Auto-Clip will not send until you Connect again.", "info", 4000); } catch (e) {}
+    }
+
+    async function testClipServerConnection() {
+      return connectClipServer();
+    }
+
+    /** After local clips are written, mirror to Google Drive AI Library when Save location is Drive. */
+    async function mirrorClipsToSaveLocation(clipResult) {
+      if (!clipResult || !clipResult.clips || !clipResult.clips.length) return "";
+      const wantDrive = typeof preferGoogleDriveSaves === "function" && preferGoogleDriveSaves();
+      if (!wantDrive) {
+        return " Saved on this PC under AI Library/Clips (local).";
+      }
+      if (typeof isGoogleSignedIn !== "function" || !isGoogleSignedIn()) {
+        return " Clips on this PC only (Drive selected but not connected).";
+      }
+      try {
+        if (typeof ensureGoogleDriveFolderStructure === "function") {
+          try { await ensureGoogleDriveFolderStructure(); } catch (e) {}
+        }
+        const folder = typeof getDriveFolderForPurpose === "function" ? getDriveFolderForPurpose("aiLibrary") : null;
+        if (!folder || !folder.id) return " Clips on PC; Drive AI Library folder not set.";
+        const base = getClipServerUrl();
+        let uploaded = 0;
+        for (let i = 0; i < clipResult.clips.length; i++) {
+          const rel = clipResult.clips[i];
+          if (!rel) continue;
+          const fileUrl = base + "/clip/file?rel=" + encodeURIComponent(rel);
+          const resp = await fetch(fileUrl);
+          if (!resp.ok) continue;
+          const blob = await resp.blob();
+          const parts = String(rel).split(/[/\\]/);
+          const fname = parts[parts.length - 1] || ("clip_" + i + ".mp4");
+          // Preserve match subfolder in name when possible
+          const matchFolder = parts.length > 1 ? parts[parts.length - 2] : "";
+          const driveName = matchFolder ? (matchFolder + "__" + fname) : fname;
+          await uploadBlobToGoogleDrive(folder.id, driveName, blob, blob.type || "video/mp4");
+          uploaded++;
+        }
+        // Also try labels jsonl snippet is optional
+        return uploaded
+          ? (" Also uploaded " + uploaded + " clip(s) to Google Drive → " + (folder.name || "AI Library") + ".")
+          : " Clips on PC; Drive upload found no fetchable files.";
+      } catch (e) {
+        console.warn("mirror clips to Drive", e);
+        return " Clips on PC; Drive upload failed: " + (e.message || e);
+      }
+    }
+
+    /** Fire-and-forget POST of a just-committed match to the local Python clip server. */
     async function postMatchToClipServer(example) {
       if (!appConfig.autoClipEnabled) return null;
-      const url = (appConfig.autoClipServerUrl || "").trim();
-      if (!url) return "Auto-clip enabled but no server URL is set.";
+      const url = getClipServerUrl();
+      if (!clipServerConnected) {
+        // Soft try-connect once
+        try { await connectClipServer(); } catch (e) {}
+      }
+      if (!clipServerConnected) {
+        return "Auto-clip on, but clip server is not connected. Use Admin → Auto-Clip → Connect.";
+      }
       const manifest = await buildClipManifestForExample(example);
       if (!manifest.events.length) return "No timestamped events to clip.";
       try {
@@ -9735,112 +9881,78 @@
           if (!blob) return "Local video not found in browser storage; skipped auto-clip.";
           form.append("video", blob, manifest.video_file_name || (example.id + ".mp4"));
         }
-        const resp = await fetch(url.replace(/\/$/, "") + "/clip", { method: "POST", body: form });
+        const resp = await fetch(url + "/clip", { method: "POST", body: form });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) return "Clip server error: " + (data.error || resp.status);
-        return "Clip server: " + (data.clips_written != null ? data.clips_written + " clip(s) written." : "done.");
+        let msg = "Clip server: " + (data.clips_written != null ? data.clips_written + " clip(s) written." : "done.");
+        try {
+          msg += await mirrorClipsToSaveLocation(data);
+        } catch (e) {}
+        return msg;
       } catch (err) {
-        return "Could not reach clip server at " + url + " (" + (err.message || err) + "). Is it running?";
+        clipServerConnected = false;
+        clipServerStatusDetail = "Lost connection: " + (err.message || err);
+        updateClipServerStatusUI();
+        return "Could not reach clip server at " + url + " (" + (err.message || err) + "). Is the launcher running?";
       }
     }
 
-    async function testClipServerConnection() {
-      const statusEl = document.getElementById("clip-server-status");
-      const urlEl = document.getElementById("clip-server-url");
-      const url = ((urlEl && urlEl.value) || appConfig.autoClipServerUrl || "").trim();
-      if (statusEl) statusEl.textContent = "Checking…";
-      try {
-        const resp = await fetch(url.replace(/\/$/, "") + "/health", { method: "GET" });
-        if (!resp.ok) throw new Error("HTTP " + resp.status);
-        const data = await resp.json().catch(() => ({}));
-        const extra = [];
-        if (data.status) extra.push(data.status);
-        if (data.lora || data.predict) extra.push("LoRA ready");
-        if (statusEl) { statusEl.textContent = "✓ Connected" + (extra.length ? " (" + extra.join(", ") + ")" : ""); statusEl.style.color = "var(--green)"; }
-      } catch (err) {
-        if (statusEl) { statusEl.textContent = "✗ Not reachable — start mat_scout_clip_server.py / app.py"; statusEl.style.color = "var(--red)"; }
+    /** Batch-send AI Training Library examples to the local clipper (when Auto-Clip was off at commit). */
+    async function sendAiTrainingLibraryToClipper() {
+      if (!aiTrainingLibrary.length) return toast("AI Training Library is empty.");
+      if (!clipServerConnected) {
+        const ok = await connectClipServer();
+        if (!ok) return;
       }
+      let sent = 0, skipped = 0, errors = 0;
+      const notes = [];
+      for (let i = 0; i < aiTrainingLibrary.length; i++) {
+        const ex = aiTrainingLibrary[i];
+        if (!ex) { skipped++; continue; }
+        const v = ex.video || {};
+        if (v.type !== "file") {
+          skipped++;
+          continue;
+        }
+        try {
+          const wasEnabled = appConfig.autoClipEnabled;
+          appConfig.autoClipEnabled = true;
+          // postMatch requires autoClipEnabled; temporarily force
+          clipServerConnected = true;
+          const manifest = await buildClipManifestForExample(ex);
+          if (!manifest.events.length) { skipped++; appConfig.autoClipEnabled = wasEnabled; continue; }
+          const form = new FormData();
+          form.append("manifest", JSON.stringify(manifest));
+          const blob = await idbGetTrainingVideo(ex.id);
+          if (!blob) { skipped++; appConfig.autoClipEnabled = wasEnabled; continue; }
+          form.append("video", blob, manifest.video_file_name || (ex.id + ".mp4"));
+          const resp = await fetch(getClipServerUrl() + "/clip", { method: "POST", body: form });
+          const data = await resp.json().catch(() => ({}));
+          appConfig.autoClipEnabled = wasEnabled;
+          if (!resp.ok) { errors++; notes.push((ex.wrestlerName || "match") + ": " + (data.error || resp.status)); continue; }
+          sent++;
+          try { await mirrorClipsToSaveLocation(data); } catch (e) {}
+        } catch (e) {
+          errors++;
+          notes.push((ex.wrestlerName || "match") + ": " + (e.message || e));
+        }
+      }
+      toast(
+        "Sent library to clipper: " + sent + " clipped, " + skipped + " skipped (need local file video), " + errors + " error(s)." +
+        (notes.length ? "\n" + notes.slice(0, 5).join("\n") : "") +
+        "\nFiles go to AI Library/Clips on this PC" +
+        (preferGoogleDriveSaves() && isGoogleSignedIn() ? " and Drive when connected." : "."),
+        errors ? "error" : "success",
+        9000
+      );
     }
 
     function exportAiTrainingLibraryForKaggle() {
-      if (!aiTrainingLibrary.length) return toast("AI Training Library is empty.");
-      const exportedAt = new Date().toISOString();
-      const move_classes = [];
-      Object.keys(taxonomy.MOVE_GROUPS || {}).forEach(cat => {
-        const val = taxonomy.MOVE_GROUPS[cat];
-        if (Array.isArray(val)) val.forEach(m => move_classes.push({ category: cat, move: m }));
-        else if (val && typeof val === "object") Object.keys(val).forEach(sub => (val[sub]||[]).forEach(m => move_classes.push({ category: cat, sub_category: sub, move: m })));
-      });
-      const matches = [];
-      const eventRows = [];
-      aiTrainingLibrary.forEach((ex, matchIndex) => {
-        const match_id = ex.id || ("match_" + matchIndex);
-        const video = ex.video || { type: "none" };
-        const video_file_name = video.type === "file" ? (video.fileName || match_id + ".mp4") : (video.type === "youtube" ? ("youtube_" + (video.youtubeId || match_id) + ".mp4") : "");
-        const youtube_id = video.type === "youtube" ? (video.youtubeId || "") : "";
-        const youtube_url = video.type === "youtube" ? (video.youtubeUrl || (youtube_id ? "https://www.youtube.com/watch?v=" + youtube_id : "")) : "";
-        const events = Array.isArray(ex.events) ? ex.events : [];
-        const result = ex.result || {};
-        const app = ex.ourAppearance || {};
-        matches.push({
-          match_id, match_index: matchIndex, saved_at: ex.savedAt || "", season_name: ex.seasonName || "",
-          wrestler_name: ex.wrestlerName || "", weight_class: ex.weightClass || "", division: ex.division || "",
-          opponent: ex.opponent || "", level: ex.level || "", date: ex.date || "", source: ex.source || "manual",
-          pov: "our_wrestler",
-          ankle_band: app.ankleBand || "", singlet_color: app.singletColor || "", singlet_secondary: app.singletSecondary || "",
-          appearance_notes: app.notes || "", our_appearance_text: ex.ourAppearanceText || "",
-          result_our_points: result.ourP != null ? result.ourP : "", result_opp_points: result.oppP != null ? result.oppP : "",
-          result_outcome: result.outcome || "", result_method: result.method || "", event_count: events.length,
-          video_type: video.type || "none", video_file_name, video_has_local_blob: !!video.hasLocalBlob, youtube_id, youtube_url
-        });
-        events.forEach((e, eventIndex) => {
-          const ts = e.timestamp || "";
-          const parts = String(ts).split(":").map(Number);
-          const tSec = (parts.length === 2 && parts.every(n => !isNaN(n))) ? parts[0]*60+parts[1] : "";
-          eventRows.push({
-            match_id, event_index: eventIndex, event_id: e.id || (match_id + "_e" + eventIndex),
-            timestamp: ts, time_sec: tSec,
-            window_start_sec: tSec === "" ? "" : Math.max(0, tSec - (Number(appConfig.clipSecondsBefore) || 4)),
-            window_end_sec: tSec === "" ? "" : tSec + (Number(appConfig.clipSecondsAfter) || 1.5),
-            period: e.period || "", category: e.category || "", sub_category: e.subCategory || "",
-            move: e.move || "", direction: e.direction || "", outcome: e.outcome || "",
-            points: e.points != null ? e.points : "", detail: e.detail || "",
-            tie: formatModifiersPlainForEvent(e) || e.tie || "",
-            modifiers_json: JSON.stringify(parseEventModifiers(e)),
-            tie_opp: (parseEventModifiers(e).opp.ties || []).join(" + "),
-            finish_opp: (parseEventModifiers(e).opp.finishes || []).join(" + "),
-            ride_opp: (parseEventModifiers(e).opp.rides || []).join(" + "),
-            tie_our: (parseEventModifiers(e).our.ties || []).join(" + "),
-            finish_our: (parseEventModifiers(e).our.finishes || []).join(" + "),
-            ride_our: (parseEventModifiers(e).our.rides || []).join(" + "),
-            label_primary: (e.category === "Choice") ? ("CHOICE:" + (e.detail || e.move || "")) : ((e.category||"") + ":" + (e.move||"")),
-            label_with_outcome: (e.category === "Choice") ? ("CHOICE:" + (e.detail || e.move || "")) : ((e.category||"") + ":" + (e.move||"") + ":" + (e.outcome||"")),
-            actor: e.direction === "defense" ? "opponent" : "our_wrestler",
-            wrestler_name: ex.wrestlerName || "", opponent_name: ex.opponent || "",
-            ankle_band: app.ankleBand || "", singlet_color: app.singletColor || "",
-            video_file_name, youtube_id, youtube_url, confidence: e.confidence || "", source: e.source || ex.source || "manual"
-          });
-        });
-      });
-      const dataset = {
-        type: "mat-scout-kaggle-wrestling-dataset", version: 1, exported_at: exportedAt,
-        task: "wrestling_match_event_recognition",
-        description: "Coach-verified folkstyle events from Strategic Wrestler. POV = our wrestler. Includes appearance (ankle band/singlet).",
-        taxonomy: { move_classes, ties: taxonomy.TIE_MODIFIERS||[], finishes: taxonomy.FINISH_MODIFIERS||[], rides: taxonomy.RIDE_MODIFIERS||[] },
-        stats: { match_count: matches.length, event_count: eventRows.length },
-        matches, events: eventRows
-      };
-      const eventCols = ["match_id","event_index","event_id","timestamp","time_sec","window_start_sec","window_end_sec","period","category","sub_category","move","direction","outcome","points","detail","tie","modifiers_json","tie_opp","finish_opp","ride_opp","tie_our","finish_our","ride_our","label_primary","label_with_outcome","actor","wrestler_name","opponent_name","ankle_band","singlet_color","video_file_name","youtube_id","youtube_url","confidence","source"];
-      const eventsCsv = [eventCols.join(",")].concat(eventRows.map(r => eventCols.map(c => csvEscape(r[c])).join(","))).join("\n");
-      const matchCols = ["match_id","match_index","saved_at","season_name","wrestler_name","weight_class","division","opponent","level","date","source","pov","ankle_band","singlet_color","singlet_secondary","appearance_notes","our_appearance_text","result_our_points","result_opp_points","result_outcome","result_method","event_count","video_type","video_file_name","video_has_local_blob","youtube_id","youtube_url"];
-      const matchesCsv = [matchCols.join(",")].concat(matches.map(r => matchCols.map(c => csvEscape(r[c])).join(","))).join("\n");
-      const readme = `Strategic Wrestler Kaggle Dataset\nExported: ${exportedAt}\nMatches: ${matches.length}\nEvents: ${eventRows.length}\n\nPOV: our_wrestler (offense = us, defense = faced).\nAppearance columns: ankle_band, singlet_color.\nVideos: place files in videos/ named video_file_name, or use youtube_id.\nPrimary table: mat-scout-kaggle-events.csv\n`;
-      downloadTextFile("mat-scout-kaggle-dataset.json", JSON.stringify(dataset, null, 2), "application/json", "aiLibrary");
-      setTimeout(() => downloadTextFile("mat-scout-kaggle-events.csv", eventsCsv, "text/csv", "aiLibrary"), 400);
-      setTimeout(() => downloadTextFile("mat-scout-kaggle-matches.csv", matchesCsv, "text/csv", "aiLibrary"), 800);
-      setTimeout(() => downloadTextFile("mat-scout-kaggle-README.txt", readme, "text/plain", "aiLibrary"), 1200);
-      toast("Kaggle export started (" + matches.length + " matches, " + eventRows.length + " events). Upload videos separately.");
+      // Legacy name kept for onclick compatibility — now sends library to local clipper
+      return sendAiTrainingLibraryToClipper();
     }
+
+        // (legacy CSV Kaggle export removed — use Send library to clipper)
 
     function importAiTrainingLibraryFromFile(file) {
       if (!file) return;
@@ -14572,7 +14684,8 @@ const teamOpsBody = `
 const aiBody = `
         <p style="font-size:11px; color:var(--muted); margin:0 0 10px 0;">
           Ground-truth matches saved from Scout when <strong>Add to AI training library</strong> is checked on commit.
-          Examples include the full scoring log plus a YouTube link or a local video copy (IndexedDB).
+          Examples include the full scoring log plus a local video copy (IndexedDB).
+          If Auto-Clip was off, use <strong>Send library to clipper</strong> later to cut clips (local file videos only).
         </p>
         <div style="font-size:12px; margin-bottom:8px;">
           <strong>${aiTrainingLibrary.length}</strong> example(s) stored
@@ -14581,7 +14694,7 @@ const aiBody = `
         </div>
         <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
           <button class="btn btn-gold" style="font-size:11px;" onclick="exportAiTrainingLibrary()" ${aiTrainingLibrary.length ? '' : 'disabled'}>Export Library JSON</button>
-          <button class="btn btn-green" style="font-size:11px;" onclick="exportAiTrainingLibraryForKaggle()" ${aiTrainingLibrary.length ? '' : 'disabled'}>Export for Kaggle</button>
+          <button class="btn btn-green" style="font-size:11px;" onclick="sendAiTrainingLibraryToClipper()" ${aiTrainingLibrary.length ? '' : 'disabled'} title="Send library matches with local video to the clip server (same as Auto-Clip)">Send library to clipper</button>
           <button class="btn btn-green" style="font-size:11px;" onclick="triggerImportAiTrainingLibrary()">Import Library JSON</button>
           <button class="btn btn-red" style="font-size:11px;" onclick="clearAiTrainingLibrary()" ${aiTrainingLibrary.length ? '' : 'disabled'}>Clear Library</button>
         </div>
@@ -14641,20 +14754,26 @@ const aiBody = `
 
       const autoClipBody = `
         <p style="font-size:11px; color:var(--muted); margin:0 0 10px 0;">
-          When enabled, committing a match (with training library checked) also sends it to a local Python clip server on this computer.
+          Cuts training clips on <strong>this computer</strong> (no internet required).
+          The SW launcher starts the clip server on <code>localhost:5057</code>.
+          Clips are written to <strong>AI Library/Clips</strong> on disk; when your Save location is Google Drive and you are connected, copies are also uploaded to Drive → AI Library.
         </p>
-        <label style="display:flex; align-items:flex-start; gap:8px; margin:0 0 10px 0; font-size:12px; color:var(--chalk); cursor:pointer;">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:0 0 12px 0; padding:10px 12px; border:1px solid var(--panelLine); border-radius:8px; background:var(--mat, rgba(0,0,0,0.2));">
+          <span style="font-size:11px; color:var(--muted); font-weight:700;">CLIP SERVER</span>
+          <span id="clip-server-pill" style="font-size:11px; font-weight:800; padding:3px 10px; border-radius:999px; border:1px solid var(--red); color:var(--red); background:rgba(180,60,60,0.15);">${clipServerConnected ? "Connected" : "Not connected"}</span>
+          <span style="font-size:10px; color:var(--muted);">localhost:5057</span>
+          <div style="flex:1;"></div>
+          <button type="button" class="btn btn-green" style="font-size:11px;" onclick="connectClipServer()">Connect</button>
+          <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="disconnectClipServer()">Disconnect</button>
+          <button type="button" class="btn btn-gold" style="font-size:11px;" onclick="testClipServerConnection()">Test Connection</button>
+        </div>
+        <p id="clip-server-status" style="font-size:11px; color:var(--muted); margin:0 0 12px 0;">${swEsc(clipServerStatusDetail || (clipServerConnected ? "Connected" : "Not connected — start the SW launcher (with Flask) then Connect."))}</p>
+        <label style="display:flex; align-items:flex-start; gap:8px; margin:0 0 6px 0; font-size:12px; color:var(--chalk); cursor:pointer;">
           <input type="checkbox" style="margin-top:3px;" ${appConfig.autoClipEnabled ? 'checked' : ''}
-            onchange="appConfig.autoClipEnabled = this.checked; persist();" />
-          <span><strong style="color:var(--gold);">Auto-send committed matches to local clip server</strong></span>
-        </label>
-        <label class="fld-label">Clip Server URL</label>
-        <input id="clip-server-url" class="input" value="${swEsc(appConfig.autoClipServerUrl)}"
-          onchange="appConfig.autoClipServerUrl = this.value.trim(); persist();" />
-        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:4px;">
-          <button class="btn btn-gold" style="font-size:11px;" onclick="testClipServerConnection()">Test Connection</button>
-          <span id="clip-server-status" style="font-size:11px; color:var(--muted);"></span>
-        </div>`;
+            onchange="appConfig.autoClipEnabled = this.checked; persist(); if (this.checked && !clipServerConnected) connectClipServer();" />
+          <span><strong style="color:var(--gold);">Auto-send committed matches to local clip server</strong>
+          <span style="display:block; font-size:10px; color:var(--muted); font-weight:500; margin-top:2px;">Works offline. Uses the same Save location (local folder or Google Drive AI Library) for mirrored copies.</span></span>
+        </label>`;
 
       const thresholdsBody = `
         <p style="font-size:12px; color:var(--muted); margin-bottom:8px;">
@@ -18926,6 +19045,30 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       }
       return res.json();
     }
+    /** Replace content of an existing Drive file (keeps same file id / name). */
+    async function updateBlobOnGoogleDrive(fileId, blob, mimeType) {
+      if (!fileId) throw new Error("No Drive file id.");
+      const token = await ensureGoogleToken();
+      const mime = mimeType || blob.type || "application/octet-stream";
+      const res = await fetch(
+        "https://www.googleapis.com/upload/drive/v3/files/" + encodeURIComponent(fileId) +
+        "?uploadType=media&fields=id,name,modifiedTime",
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: "Bearer " + token,
+            "Content-Type": mime
+          },
+          body: blob
+        }
+      );
+      if (!res.ok) {
+        const raw = await res.text();
+        throw new Error(formatGoogleApiError(raw));
+      }
+      return res.json();
+    }
+
     async function uploadTextToGoogleDrive(folderId, filename, text, mimeType) {
       const mime = mimeType || "application/json";
       const blob = new Blob([text], { type: mime });
@@ -19397,6 +19540,145 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       applyFullBackupPayload(payload);
     }
 
+    
+    /**
+     * Upload files from the local Strategic Wrestler folders to the matching Google Drive folders.
+     * Ensures Drive has the latest Backups / Exports / Archives / AI Library / MatSide files.
+     */
+    async function syncLocalFoldersToGoogleDrive() {
+      try {
+        if (typeof guardPresenceEdit === "function" && guardPresenceEdit("Drive Sync")) return;
+        if (typeof isGoogleSignedIn !== "function" || !isGoogleSignedIn()) {
+          toast("Connect Google Drive first (Admin or the G badge), then use Drive Sync.", "info", 6000);
+          try { if (typeof connectGoogleDrive === "function") await connectGoogleDrive(); } catch (e) {}
+          if (!isGoogleSignedIn()) return;
+        }
+        let root = localSwRootHandle || (typeof loadLocalSwRootHandle === "function" ? await loadLocalSwRootHandle() : null);
+        if (!root) {
+          toast("Choose your local Strategic Wrestler folder first (Admin → Choose local folder).", "info", 7000);
+          if (typeof pickLocalSwRootFolder === "function") {
+            root = await pickLocalSwRootFolder();
+          }
+          if (!root) return;
+        }
+        if (typeof ensureLocalSwPermission === "function") {
+          const okPerm = await ensureLocalSwPermission(root, "read");
+          if (!okPerm) {
+            toast("Permission needed to read the local Strategic Wrestler folder.", "error", 6000);
+            return;
+          }
+        }
+        if (typeof ensureGoogleDriveFolderStructure === "function") {
+          try { await ensureGoogleDriveFolderStructure(); } catch (e) {}
+        }
+        const purposes = ["backup", "exports", "archives", "aiLibrary", "matside"];
+        let uploaded = 0, updated = 0, skipped = 0, folderSkip = 0, errors = 0;
+        const errNotes = [];
+
+        async function listAllDriveFilesInFolder(folderId) {
+          const map = {};
+          if (!folderId) return map;
+          let pageToken = "";
+          do {
+            let q = "'" + folderId + "' in parents and trashed = false";
+            let path = "/files?q=" + encodeURIComponent(q) +
+              "&pageSize=100&fields=nextPageToken,files(id,name,modifiedTime,size,mimeType)";
+            if (pageToken) path += "&pageToken=" + encodeURIComponent(pageToken);
+            const res = await driveFetch(path);
+            const data = await res.json();
+            (data.files || []).forEach(function (f) {
+              if (f && f.name) map[f.name] = f;
+            });
+            pageToken = data.nextPageToken || "";
+          } while (pageToken);
+          return map;
+        }
+
+        async function syncDirFiles(dirHandle, folderId, prefix, driveByName) {
+          if (!dirHandle || !folderId) return;
+          for await (const entry of dirHandle.values()) {
+            const name = entry.name || "";
+            if (entry.kind === "file") {
+              try {
+                const file = await entry.getFile();
+                const driveName = prefix ? (prefix + "__" + name) : name;
+                const localMs = file.lastModified || 0;
+                const existing = driveByName[driveName];
+                if (existing) {
+                  const driveMs = Date.parse(existing.modifiedTime || 0) || 0;
+                  // Skip if Drive is same age or newer (2s tolerance for clock/upload lag)
+                  if (driveMs + 2000 >= localMs) {
+                    skipped++;
+                    continue;
+                  }
+                  await updateBlobOnGoogleDrive(existing.id, file, file.type || "application/octet-stream");
+                  existing.modifiedTime = new Date().toISOString();
+                  updated++;
+                } else {
+                  const created = await uploadBlobToGoogleDrive(folderId, driveName, file, file.type || "application/octet-stream");
+                  if (created && created.id) {
+                    driveByName[driveName] = {
+                      id: created.id,
+                      name: driveName,
+                      modifiedTime: new Date().toISOString()
+                    };
+                  }
+                  uploaded++;
+                }
+              } catch (e) {
+                errors++;
+                if (errNotes.length < 5) errNotes.push(name + ": " + (e.message || e));
+              }
+            } else if (entry.kind === "directory") {
+              try {
+                const sub = await dirHandle.getDirectoryHandle(name);
+                await syncDirFiles(sub, folderId, prefix ? (prefix + "__" + name) : name, driveByName);
+              } catch (e) {
+                errors++;
+              }
+            }
+          }
+        }
+
+        toast("Drive Sync started (new + newer files only)…", "info", 2500);
+        for (const purpose of purposes) {
+          const subName = localSwSubfolderName(purpose);
+          let localDir = null;
+          try {
+            localDir = await root.getDirectoryHandle(subName, { create: false });
+          } catch (e) {
+            folderSkip++;
+            continue;
+          }
+          const driveFolder = getDriveFolderForPurpose(purpose);
+          if (!driveFolder || !driveFolder.id) {
+            folderSkip++;
+            continue;
+          }
+          let driveByName = {};
+          try {
+            driveByName = await listAllDriveFilesInFolder(driveFolder.id);
+          } catch (e) {
+            errors++;
+            if (errNotes.length < 5) errNotes.push(subName + " list: " + (e.message || e));
+            continue;
+          }
+          await syncDirFiles(localDir, driveFolder.id, "", driveByName);
+        }
+        toast(
+          "Drive Sync finished: " + uploaded + " new, " + updated + " updated, " + skipped + " already current" +
+          (folderSkip ? (", " + folderSkip + " folder(s) skipped") : "") +
+          (errors ? (", " + errors + " error(s)") : "") + "." +
+          (errNotes.length ? "\n" + errNotes.join("\n") : ""),
+          errors ? "error" : "success",
+          9000
+        );
+      } catch (e) {
+        toast("Drive Sync failed: " + (e.message || e), "error", 8000);
+      }
+    }
+
+
     async function saveSharedSeasonData() {
       try {
         const target = resolveIoTarget("Save");
@@ -19426,20 +19708,25 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
     async function pruneOldBackupsIfEnabled(target) {
       if (!appConfig || appConfig.pruneBackupsAfter5Days === false) return;
-      const cutoff = Date.now() - (5 * 24 * 60 * 60 * 1000);
+      const keepN = Math.max(1, parseInt(appConfig.pruneBackupsKeepCount, 10) || 5);
       let removed = 0;
+
+      function isBackupName(name) {
+        const n = String(name || "");
+        if (!/\.json$/i.test(n)) return false;
+        return /backup|strategic-wrestler|mat-scout/i.test(n);
+      }
+
       if (target === "drive" && typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
         try {
           const files = await listDriveBackups();
-          for (const f of files) {
-            const t = Date.parse(f.modifiedTime || 0);
-            if (!t || t >= cutoff) continue;
-            const name = String(f.name || "");
-            if (!/backup|strategic-wrestler|mat-scout/i.test(name)) continue;
+          // Newest first (listDriveBackups orders by modifiedTime desc)
+          const backups = (files || []).filter(f => isBackupName(f.name));
+          for (let i = keepN; i < backups.length; i++) {
             try {
-              await driveFetch("/files/" + encodeURIComponent(f.id), { method: "DELETE" });
+              await driveFetch("/files/" + encodeURIComponent(backups[i].id), { method: "DELETE" });
               removed++;
-            } catch (e) { console.warn("prune drive file", f.name, e); }
+            } catch (e) { console.warn("prune drive file", backups[i].name, e); }
           }
         } catch (e) { console.warn("prune drive list", e); }
       }
@@ -19455,27 +19742,27 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
             } catch (e2) { backupsDir = null; }
           }
           if (backupsDir && backupsDir.values) {
-            const toDelete = [];
+            const entries = [];
             for await (const entry of backupsDir.values()) {
               if (entry.kind !== "file") continue;
-              const n = entry.name || "";
-              if (!/\.json$/i.test(n)) continue;
-              if (!/backup|strategic-wrestler|mat-scout/i.test(n)) continue;
+              if (!isBackupName(entry.name)) continue;
               try {
                 const file = await entry.getFile();
-                if (file.lastModified && file.lastModified < cutoff) toDelete.push(entry.name);
+                entries.push({ name: entry.name, modified: file.lastModified || 0 });
               } catch (e) {}
             }
-            for (const name of toDelete) {
-              try { await backupsDir.removeEntry(name); removed++; } catch (e) {}
+            entries.sort((a, b) => b.modified - a.modified);
+            for (let i = keepN; i < entries.length; i++) {
+              try { await backupsDir.removeEntry(entries[i].name); removed++; } catch (e) {}
             }
           }
         } catch (e) { console.warn("prune local", e); }
       }
       if (removed > 0) {
-        try { toast("Removed " + removed + " backup(s) older than 5 days.", "info", 4000); } catch (e) {}
+        try { toast("Removed " + removed + " older backup(s); kept the newest " + keepN + ".", "info", 4000); } catch (e) {}
       }
     }
+
 
     async function loadSharedSeasonData() {
       try {
@@ -19884,257 +20171,59 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
     const MAT_SCOUT_CHANGELOG = [
       {
+        build: "2026-10-11-clip-drive-sync",
+        items: [
+          "Auto-Clip: Connect / Disconnect / status pill (localhost:5057); URL field removed",
+          "Clip Connect shows install help (pip install flask flask-cors + ffmpeg) when the server is missing",
+          "Clips respect Save location — local AI Library/Clips, and mirror to Drive AI Library when Drive is selected",
+          "AI Training Library: Send library to clipper (replaces Export for Kaggle for the clipper workflow)",
+          "Top bar: Drive Sync uploads local Strategic Wrestler folders to matching Google Drive folders",
+          "Backup retention: keep the last 5 Save files (not 5 calendar days)",
+          "Presence view-only lock for second coaches; MatSide weight-class transfer from SW export"
+        ]
+      },
+      {
         build: "2026-09-18-banner-theme",
         items: [
           "New default banner installed; the old placeholder banner is fully removed from the app",
           "Admin: Revert to Default Banner button",
-          "Top bar reorganized \u2014 line 1 is team name, dual record, style, Load, Save; line 2 is Season and Event",
+          "Top bar reorganized — line 1 is team name, dual record, style, Load, Save; line 2 is Season and Event",
           "Admin Team Setup: create and delete custom roster flags, togglable per-athlete on Edit Athlete and shown on the roster",
           "Custom Awards: Tournament / Weekly / Monthly / Annual / Special category, awards list now in 3 columns",
           "Roster: Create Season, Add Bout/Event, and Add Wrestler are green",
           "Scout: Start Scoring Match and Analyze Match are green; Discard Match is red",
-          "Riding time redesigned \u2014 state and icon now live on the Our RT / Opp RT buttons themselves, with a light pulse while running; manual +1 RT button and a help icon added",
-          "Event log Undo button restyled gold-on-gold to match the Hide buttons",
-          "Accent Gold now only recolors headings \u2014 buttons, stats, ratios, and badges keep a fixed gold regardless of theme changes",
-          "Admin: auto color-match the theme to the banner, plus a button to rotate the color scheme through the banner's palette",
-          "Admin Screen Layout & Appearance: dropdown to change the font used on every heading"
+          "Riding time redesigned — state and icon on the Our RT / Opp RT buttons; manual +1 RT and help icon",
+          "Accent Gold now only recolors headings — buttons and badges keep fixed gold",
+          "Admin: auto color-match theme to the banner; rotate color scheme through the banner palette"
         ]
       },
       {
         build: "2026-09-17-fall-times",
         items: [
-          "Scoring a pin now prompts for the fall time; reaching the tech margin prompts for the tech fall time",
-          "Tech fall times are stored per match and editable by clicking them on the Bout Sheet",
-          "Fall time editing moved from a browser prompt to a proper in-app dialog",
-          "Bout Sheet: help icon on Varsity Dual Competition explaining match log review and time editing",
-          "Hall of Fame style headers color-coded to match the ruleset chip (Folkstyle gold, Freestyle blue, Greco purple)",
+          "Scoring a pin prompts for fall time; tech margin prompts for tech fall time",
+          "Tech fall times stored per match and editable on the Bout Sheet",
+          "Fall time editing moved to an in-app dialog",
+          "Hall of Fame headers color-coded to the ruleset chip",
           "Scout and AI Scout: Match Level, Select Opponent from Event Roster, Custom Opponent Name",
-          "Roster: min weight now reads (min 98 lbs)",
           "Training Plan modifiers relabeled Our Ties and Opponent Ties",
-          "Calendar help corrected — combined Boys/Girls events are purple, not green",
-          "Attendance help now explains how the Admin lates-per-absence weighting affects the rate",
-          "Admin: removed the Success Green swatch, removed the redundant Gear Inventory heading, Attendance Rate wording cleaned up, allow-girls and threshold labels set to white",
-          "Tutorial expanded to 12 steps with corrected menu paths, attendance setup, fall times, and dual finalization",
-          "Diagnostics expanded from 18 to 33 checks (result classification, time normalization, help coverage, data integrity)"
+          "Calendar help corrected for combined Boys/Girls events"
         ]
       },
       {
-        build: "2026-09-17-ui-polish",
+        build: "2026-09-16-storage-presence",
         items: [
-          "Help popups now layer on top of the window that opened them instead of closing it",
-          "Toasts moved to bottom center with a flash on appear",
-          "Roster: min weight shown as (min 98lbs) in white, wrestler names bolded",
-          "Roster: Add Wrestler condensed to two lines; button renamed and standardized to gold",
-          "Add Bout / Event button standardized to gold",
-          "New clock-face time picker replaces the native time inputs on Create / Edit Bout",
-          "Section headings and field labels standardized app-wide (sec-label / fld-label / sub-label)",
-          "Scout: Import MatSide JSON File, Attach MatSide Video (gold); MatSide is now one word",
-          "Bout Sheet JV & Exhibition heading and Leaderboard Print Both restyled to gold",
-          "Admin: removed duplicate School Levels heading and the redundant 'Admin —' prefix",
-          "11 new help topics added; help icons added to Admin cards, bout modals, scoring log, calendar day, and license"
+          "IndexedDB storage path with recovery snapshots",
+          "Google Drive team folder structure (Backups, Exports, Archives, AI Library, MatSide)",
+          "License activation via Supabase seats",
+          "Storage Health panel — usage, last save, full backup export"
         ]
       },
       {
-        build: "2026-09-15-ruleset-engine",
+        build: "2026-09-15-core",
         items: [
-          "HOF Edit/Delete fixed (award index lookup)",
-          "Stats Analyze print: up to 4 seasons of the active wrestling style",
-          "Header: ruleset chip replaces active-wrestler badge; color-coded by style",
-          "Attendance popup: names list scrolls (gear-scroll); modal itself does not",
-          "RT: Our/Opp buttons toggle play/pause; clocks bold; seek-hold until leave-off time",
-          "Admin Team Setup: Semi-Autonomous Riding Time checkbox (default off)",
-          "NFHS Folkstyle / UWW Freestyle / UWW Greco-Roman ruleset engine (points, Greco blocks, tech margins)",
-          "Scout: compact ruleset button before athlete selector opens scoring-rules popup (no extra Scout card)",
-          "Commit validates events against active season style"
-        ]
-      },
-      {
-        build: "2026-09-15-ruleset-engine",
-        items: [
-          "Admin New here: Tutorial + What's New / Changelog",
-          "Team Setup: Girls-in-Boys eligibility + School Levels moved here",
-          "Weight classes: Use Boys Weight Classes for Girls option",
-          "Hall of Fame: edit/delete recipients on Stats → Hall of Fame (removed Admin list)",
-          "Roster: minimum weight on edit, list, and print"
-        ]
-      },
-      {
-        build: "2026-09-15-ruleset-engine",
-        items: [
-          "AI frame extraction samples only inside event clip windows (timestamp ± before/after)",
-          "Admin: AI frames-per-second inside windows + max frames per analysis",
-          "Overlapping event windows are merged; Flow/Choice events skipped"
-        ]
-      },
-      {
-        build: "2026-09-15-ruleset-engine",
-        items: [
-          "90-day trial from first launch on each browser",
-          "Activation key unlock (SW-XXXX-XXXX-XXXX-XXXX offline verified)",
-          "License status in header; Admin → Enter activation key",
-          "Scoring / commit / add athlete gated after trial expires until activated"
-        ]
-      },
-      {
-        build: "2026-09-15-ruleset-engine",
-        items: [
-          "Google sign-in (OAuth) + Drive folder for team Save/Load",
-          "Top-bar Save uploads backup JSON to shared Drive folder when connected",
-          "Top-bar Load lists recent backups in folder and restores",
-          "Full backup restore path (file picker fallback)",
-          "Admin: Client ID, Connect/Disconnect, Choose folder"
-        ]
-      },
-      {
-        build: "2026-09-15-ruleset-engine",
-        items: [
-          "Cosmetic rebrand: Strategic Wrestler (storage keys unchanged for data compatibility)",
-          "Scout: multi-step Undo (press repeatedly to walk back actions)",
-          "Stats: fix expand for moves with apostrophes (e.g. Fireman's Carry)",
-          "Stats + Leaderboard: Riding Time totals and averages",
-          "Admin: Tutorial walkthrough; excused-absences attendance option; HOF scrollbar; shared-folder link for multi-coach Save/Load",
-          "Top bar: Active wrestler + Load/Save backup"
-        ]
-      },
-      {
-        build: "2026-09-13-roster-team-setup",
-        items: [
-          "College: Redshirt is a roster tag only (removed from Grade list)",
-          "Roster: Active/Archived filter first; single Print menu + Print button",
-          "Edit Athlete: Delete only when no matches/events/attendance; otherwise message + Archive",
-          "Admin: Team Ops renamed Team Setup; Training Plan thresholds & Awards moved here; Eligibility removed as standalone (Girls-in-Boys stays under Weight Classes)",
-          "UI polish: stacked roster toolbar, uniform toolbar control sizing"
-        ]
-      },
-      {
-        build: "2026-09-13-roster-team-setup",
-        items: [
-          "Fix: manual scoring buttons broken — jsStr() now emits HTML-safe quotes so onclick handlers parse correctly (moves like Fireman's Carry and all category/move clicks)",
-          "Fix: diagnostics tests compare win/loss (not W/L)",
-          "Guard logEvent when no match is active"
-        ]
-      },
-      {
-        build: "2026-09-13-admin-team-ops",
-        items: [
-          "Admin: new 'Team Ops' window — Team Name & Branding + Gear Inventory moved here from Screen Layout & Appearance",
-          "Admin: 'Allow Girls to wrestle in Boys duals & tournaments' moved off Weight Classes onto Team Ops and Training Plan & Awards"
-        ]
-      },
-      {
-        build: "2026-09-13-mat-side-interop",
-        items: [
-          "MatSide interop: Export for MatSide (roster + events) from Admin → Season Archive",
-          "Import MatSide Package (live score JSON) into active season as a match with timed events",
-          "Attach MatSide Video links the phone recording for Scout review",
-          "Scout video card: Import MatSide Package / Attach Video shortcuts"
-        ]
-      },
-      {
-        build: "2026-09-10-roster-scout-plan-admin",
-        items: [
-          "Roster: Injured flag moved off Add-Wrestler form onto Edit Athlete Details; added Suspended & Quit flags",
-          "Roster: Edit Athlete Details now has wrestler + 2x parent phone/email fields; Team Roster shows INJ/SUSP/QUIT tags",
-          "Roster: removed redundant Select button; added Print Expanded Roster (contact info); both print views show flags & attendance",
-          "Roster: attendance now shown as readable color-coded pill badges with a clearer help explanation",
-          "Scout: wrestler dropdown widened 50%, tightened spacing next to Score Match / AI Video Scout titles",
-          "Scout (Manual): Match Video Player now sits directly under Score Match instead of the bottom of the page",
-          "Scout (FS/GR): Our Passive button now green border/fill, Opp Passive now red (​+1 Passivity button unchanged)",
-          "Scout: event log shows DQ / Forfeit / Penalty labels (red = our side, green = opponent) instead of generic 'success'",
-          "Training Plan: Modifier Focus moved to the bottom and split into explicit Offense / Defense subsections",
-          "Calendar: month tabs spelled out (e.g. '2026 October'); cleaner 📅 icon replaces the old add-month controls",
-          "Calendar: attendance now defaults to Unknown until marked; snapshot hidden until a day has any marking",
-          "Calendar: attendance snapshot text clarified (e.g. '8/10 in attendance - 1 exc, 1 unk'); Boys/Girls/Both filter + last-name jump in the day view",
-          "Calendar: Boys events blue, Girls pink, Both green; added Print Month",
-          "Create/Edit Bout: added 'Both' division option",
-          "Admin: split Customize UI & Settings into Screen Layout & Appearance, Season & Storage Management, AI Video Scout Settings, and Training Plan & Awards windows"
-        ]
-      },
-      {
-        build: "2026-09-09-calendar-attendance",
-        items: [
-          "Scout title row: athlete + weight on one line; Score Match above video after start",
-          "Boys blocked from Girls events; passivity +1 red/green without stop/timer",
-          "Roster weight dropdown from Admin classes; Injured flag; season name = optional custom + year + style",
-          "Calendar tab with months, holidays, events, attendance (X/X - XE), roster attendance stats, late rate settings"
-        ]
-      },
-      {
-        build: "2026-09-09-scout-weight-ui",
-        items: [
-          "Scout: athlete dropdown moved into Score Match / AI Video Scout cards; standalone Athlete Under Review card removed",
-          "Scout: match weight class dropdown (defaults to roster weight; bumping up marks bout sheet ↑ Bumped)",
-          "Video help + hotkeys moved above the player"
-        ]
-      },
-      {
-        build: "2026-09-09-bout-sheet-fix",
-        items: [
-          "Pin detection no longer matches Pinch Headlock (exact Pin / Fall only)",
-          "DQ / Forfeit take priority over pin when classifying match results",
-          "Bout weight classes follow the loaded Event division, not the active wrestler",
-          "Dual empty rows only list roster athletes matching the bout division"
-        ]
-      },
-      {
-        build: "2026-09-09-intl-scoring",
-        items: [
-          "Warn before leaving Scout with an unsaved open match",
-          "FS/GR: takedowns 2 pts; Throws outcome 2/4/5; Exposure & Turns = 2-pt exposure + pin only",
-          "FS/GR: Step-Out category (1 pt), Par Terre category, Passivity Clock (replaces RT bar)",
-          "Greco: Defensive = Headlock Roll Through only; Other = Undefined only",
-          "Admin: allow Girls in Boys duals/tournaments checkbox (off by default)"
-        ]
-      },
-      {
-        build: "2026-09-09-bugfixes",
-        items: [
-          "Freestyle/Greco Exposure / Pin outcomes: 2-pt & 4-pt Exposure (no 3-pt NF) for offense, defense, and Turns",
-          "Reset riding-time clock when switching season, event, or wrestler",
-          "Revoke local video blob URLs on page unload to limit memory growth",
-          "Rebuild YouTube player when Scout DOM is recreated after tab switches",
-          "AI frame capture scales canvas from native video size (max 512px side)"
-        ]
-      },
-      {
-        build: "2026-09-08-pipeline",
-        items: [
-          "Delete match notifies local clip server (DELETE /clips/{id} or POST /clip/delete) to avoid orphaned clips",
-          "Clip manifest clamps start ≥ 0 and end to video duration when known; fractional timestamps supported",
-          "AI Scout: Local Fine-Tuned Model (Qwen-VL LoRA) via localhost /predict",
-          "Unified getPointValue docs + assertPointResolutionSanity helper",
-          "CSS utilities: .surface, .btn-card, .stat-box, .chip-compact"
-        ]
-      },
-      {
-        build: "2026-09-08-scout-polish",
-        items: [
-          "Removed GLM-4V provider, CORS failure path, and fine-tune export (Gemini only)",
-          "YouTube ID parser supports Shorts, mobile ?si=, and complex watch URLs",
-          "Scout hotkeys: Space, J/L, arrows, [ ], 1/2/3 periods",
-          "Sub-second timestamps (MM:SS.s) for sharper tagging and auto-clips"
-        ]
-      },
-      {
-        build: "2026-09-06-style",
-        items: [
-          "Changelog modal for coaches after updates (Storage Health)",
-          "Weight class presets by style (NFHS folkstyle default, UWW FS/GR, NCAA)",
-          "Season wrestling style drives scoring rules and visible move set",
-          "Admin: tag moves as Folkstyle / Freestyle / Greco when adding",
-          "Training Plan: modifier remediation drills",
-          "Admin Hall of Fame filter by wrestling style"
-        ]
-      },
-      {
-        build: "2026-09-06-rt-storage",
-        items: [
-          "Storage Health panel — usage, last save, full backup export",
-          "Riding time Start/Stop on Scout period bar",
-          "Caution (0 pts) under Penalty/DQ",
-          "Modifier analytics on Stats (Our vs Opp)",
-          "AI commit auto-appends verified events to training library",
-          "Stricter AI taxonomy normalize for Opp/Our modifiers"
+          "Strategic Wrestler core: Roster, Scout, Bout Sheet, Stats, Training Plan, Calendar, Admin",
+          "MatSide package import for live-scored matches",
+          "Rulesets: Folkstyle, Freestyle, Greco"
         ]
       }
     ];

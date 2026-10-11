@@ -202,6 +202,53 @@ def check_and_update(skip: bool = False) -> None:
     log("  (Your season data is NOT in this file — Drive/local backups are unchanged.)")
 
 
+def clip_deps_available() -> bool:
+    try:
+        import flask  # noqa: F401
+        import flask_cors  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def ensure_clip_dependencies(argv: list[str]) -> bool:
+    """Install flask + flask-cors via pip if missing. Returns True if importable afterward."""
+    if clip_deps_available():
+        return True
+    if "--no-clips" in argv:
+        return False
+    if os.environ.get("SW_SKIP_CLIP_INSTALL", "").strip().lower() in ("1", "true", "yes"):
+        log("  Clip deps missing; auto-install skipped (SW_SKIP_CLIP_INSTALL).")
+        return False
+    log("  Clip server dependencies missing — installing flask flask-cors …")
+    log("  (one-time; requires network)")
+    import subprocess
+    cmds = [
+        [sys.executable, "-m", "pip", "install", "--user", "flask", "flask-cors"],
+        [sys.executable, "-m", "pip", "install", "flask", "flask-cors"],
+    ]
+    last_err = None
+    for cmd in cmds:
+        try:
+            log("  Running: " + " ".join(cmd))
+            subprocess.check_call(cmd)
+            # Clear cached failed imports if any
+            for mod in ("flask", "flask_cors"):
+                sys.modules.pop(mod, None)
+            if clip_deps_available():
+                log("  Clip dependencies installed.")
+                return True
+        except Exception as e:
+            last_err = e
+            log(f"  Install attempt failed: {e}")
+    log("  Could not install clip dependencies automatically.")
+    if last_err:
+        log(f"  Last error: {last_err}")
+    log("  Manual fix:  python -m pip install flask flask-cors")
+    log("  Also install ffmpeg and ensure it is on PATH.")
+    return False
+
+
 def want_clip_server(argv: list[str]) -> bool:
     if "--no-clips" in argv:
         return False
@@ -212,31 +259,32 @@ def want_clip_server(argv: list[str]) -> bool:
         return False
     if env in ("1", "true", "yes"):
         return True
-    # Default: start when flask is importable (AI-ready machines)
-    try:
-        import flask  # noqa: F401
-        import flask_cors  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    # Default: try to run clip server (install deps if needed)
+    return True
 
 
 def start_clip_server_if_requested(argv: list[str]) -> None:
-    if not want_clip_server(argv):
-        if "--no-clips" in argv:
-            log("  Clip server skipped (--no-clips).")
-        else:
-            log("  Clip server skipped (install flask flask-cors for Auto-Clip, or pass --with-clips).")
+    if "--no-clips" in argv or os.environ.get("SW_WITH_CLIPS", "").strip().lower() in ("0", "false", "no"):
+        log("  Clip server skipped (--no-clips / SW_WITH_CLIPS=0).")
         return
+    if not ensure_clip_dependencies(argv):
+        log("  Clip server skipped (dependencies unavailable). Auto-Clip Connect will show install help.")
+        return
+    # Warn if ffmpeg missing (clips still need it)
+    try:
+        import shutil
+        if not shutil.which("ffmpeg"):
+            log("  Warning: ffmpeg not found on PATH — clip cutting will fail until it is installed.")
+    except Exception:
+        pass
     os.environ["SW_ROOT"] = str(ROOT)
     try:
-        # Prefer local clip_server.py next to this launcher
         sys.path.insert(0, str(ROOT))
         import clip_server  # type: ignore
         ok, msg = clip_server.start_background()
         if ok:
             log(f"  {msg}")
-            log(f"  SW Admin → Auto-Clip URL: http://localhost:{CLIP_PORT}")
+            log(f"  SW Admin → Auto-Clip: Connect (http://localhost:{CLIP_PORT})")
         else:
             log(f"  Clip server not started: {msg}")
     except Exception as e:

@@ -181,6 +181,23 @@ def create_app():
             "clips_dir": str(target_folder),
         }), 200
 
+    @app.route("/clip/file", methods=["GET"])
+    def clip_file():
+        """Serve a clip file for SW to mirror to Google Drive. Query: rel=Clips/.../file.mp4"""
+        from flask import send_file, abort
+        rel = (request.args.get("rel") or "").replace("\\", "/").lstrip("/")
+        if not rel or ".." in rel.split("/"):
+            return jsonify({"error": "invalid rel"}), 400
+        # Allow Clips/ or labels/ under AI Library
+        path = (AI_LIBRARY / rel).resolve()
+        try:
+            path.relative_to(AI_LIBRARY.resolve())
+        except ValueError:
+            return jsonify({"error": "path outside AI Library"}), 403
+        if not path.is_file():
+            return jsonify({"error": "not found", "path": str(path)}), 404
+        return send_file(path, mimetype="video/mp4" if path.suffix.lower() == ".mp4" else None, as_attachment=False)
+
     @app.route("/clips/<path:match_id>", methods=["DELETE"])
     def delete_clips(match_id):
         ensure_dirs()
