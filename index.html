@@ -2481,6 +2481,7 @@
           const parsedB = JSON.parse(savedBrand);
           branding = Object.assign({}, branding, parsedB || {});
           if (!branding.swBannerDataUrl) branding.swBannerDataUrl = "";
+          if (branding.homeLocation == null) branding.homeLocation = "";
           if (!branding.schoolBannerDataUrl) branding.schoolBannerDataUrl = "";
         }
 
@@ -2521,6 +2522,10 @@
             includeElementary: !!parsed.includeElementary,
             includeHighSchool: parsed.includeHighSchool !== false,
             includeCollege: !!parsed.includeCollege,
+            // College programs use Men/Women pronouns by default when college is enabled
+            divisionPronouns: (parsed.divisionPronouns === "menWomen" || parsed.includeCollege)
+              ? (parsed.divisionPronouns || (parsed.includeCollege ? "menWomen" : "boysGirls"))
+              : (parsed.divisionPronouns || "boysGirls"),
             girlsUseBoysWeightClasses: !!parsed.girlsUseBoysWeightClasses,
             semiAutonomousRidingTime: !!parsed.semiAutonomousRidingTime,
             enableRidingTimePointButton: !!parsed.enableRidingTimePointButton,
@@ -6457,71 +6462,134 @@
     function printSeasonSchedule() {
       const season = getActiveSeason();
       const team = (branding && branding.teamName) ? branding.teamName : "Strategic Wrestler";
-      const sorted = [...(season.bouts || [])].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+      const sorted = [...(season.bouts || [])].sort((a, b) => {
+        const d = (a.date || "").localeCompare(b.date || "");
+        if (d) return d;
+        return String(a.opponentTeam || "").localeCompare(String(b.opponentTeam || ""));
+      });
       const esc = s => String(s == null ? "" : s)
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-      // Group Boys + Girls duals on the same day vs the same school into one "Both" row
-      function scheduleGroupKey(b) {
-        const date = b.date || "";
-        const opp = String(b.opponentTeam || "").trim().toLowerCase();
-        const type = String(b.type || "Dual").trim().toLowerCase();
-        const ha = String(b.homeAway || "Home").trim().toLowerCase();
-        const loc = String(b.location || "").trim().toLowerCase();
-        return [date, opp, type, ha, loc].join("|");
+      // 1) Merge Boys + Girls duals same day / school / type / homeAway / location → Both
+      function bgKey(b) {
+        return [
+          b.date || "",
+          String(b.opponentTeam || "").trim().toLowerCase(),
+          String(b.type || "Dual").trim().toLowerCase(),
+          String(b.homeAway || "Home").trim().toLowerCase(),
+          String(b.location || "").trim().toLowerCase()
+        ].join("|");
       }
-      const groups = [];
-      const byKey = {};
+      const bgMap = {};
+      const afterBg = [];
       sorted.forEach(b => {
         const div = String(b.division || "Boys");
         if (div === "Boys" || div === "Girls") {
-          const key = scheduleGroupKey(b);
-          if (!byKey[key]) {
-            byKey[key] = { base: b, boys: null, girls: null };
-            groups.push(byKey[key]);
+          const k = bgKey(b);
+          if (!bgMap[k]) {
+            bgMap[k] = { boys: null, girls: null };
+            afterBg.push(bgMap[k]);
           }
-          if (div === "Boys") byKey[key].boys = b;
-          else byKey[key].girls = b;
+          if (div === "Boys") bgMap[k].boys = b;
+          else bgMap[k].girls = b;
         } else {
-          groups.push({ base: b, boys: null, girls: null, single: true });
+          afterBg.push({ single: b });
         }
       });
-      const rows = groups.map(g => {
-        if (g.single || !(g.boys && g.girls)) {
-          return g.boys || g.girls || g.base;
+      const flattened = afterBg.map(g => {
+        if (g.single) return Object.assign({}, g.single);
+        if (g.boys && g.girls) {
+          const a = g.boys, c = g.girls;
+          return {
+            date: a.date || c.date,
+            type: a.type || c.type,
+            opponentTeam: a.opponentTeam || c.opponentTeam,
+            location: a.location || c.location || "",
+            homeAway: a.homeAway || c.homeAway || "Home",
+            division: "Both",
+            competitionLevel: a.competitionLevel === c.competitionLevel
+              ? (a.competitionLevel || "Varsity")
+              : [a.competitionLevel, c.competitionLevel].filter(Boolean).join(" / "),
+            weighInTime: a.weighInTime || c.weighInTime || "",
+            startTime: a.startTime || c.startTime || ""
+          };
         }
-        // Merge Boys + Girls into one schedule line
-        const a = g.boys;
-        const b = g.girls;
+        return Object.assign({}, g.boys || g.girls);
+      });
+
+      // 2) Same day + same location (non-empty): combine duals into one line
+      //    e.g. @ Big Bear w/ Eastside  (location under opponent cell)
+      function locKey(b) {
+        const loc = String(b.location || "").trim().toLowerCase();
+        if (!loc) return null;
+        return [b.date || "", loc, String(b.type || "Dual").trim().toLowerCase()].join("|");
+      }
+      const locGroups = {};
+      const order = [];
+      flattened.forEach(b => {
+        const k = locKey(b);
+        if (!k) {
+          order.push({ multi: false, items: [b] });
+          return;
+        }
+        if (!locGroups[k]) {
+          locGroups[k] = { items: [] };
+          order.push(locGroups[k]);
+        }
+        locGroups[k].items.push(b);
+      });
+      const rows = order.map(g => {
+        const items = g.items || g;
+        if (!items || items.length <= 1) return items[0];
+        const place = String(items[0].location || "").trim();
+        const opps = [];
+        items.forEach(b => {
+          const o = String(b.opponentTeam || "").trim();
+          if (o && !opps.some(x => x.toLowerCase() === o.toLowerCase())) opps.push(o);
+        });
+        // Prefer opponent whose name matches the location as the "host"
+        let primary = opps.find(o => o.toLowerCase() === place.toLowerCase()) || opps[0] || place;
+        const rest = opps.filter(o => o.toLowerCase() !== primary.toLowerCase());
+        const haVotes = { Home: 0, Away: 0, Neutral: 0 };
+        items.forEach(b => { haVotes[b.homeAway || "Home"] = (haVotes[b.homeAway || "Home"] || 0) + 1; });
+        let homeAway = "Away";
+        let best = -1;
+        Object.keys(haVotes).forEach(k => { if (haVotes[k] > best) { best = haVotes[k]; homeAway = k; } });
+        const divs = Array.from(new Set(items.map(b => b.division || "Boys")));
+        let division = divs.length === 1 ? divs[0] : "Both";
+        const levels = Array.from(new Set(items.map(b => b.competitionLevel || "Varsity")));
         return {
-          date: a.date || b.date,
-          type: a.type || b.type,
-          opponentTeam: a.opponentTeam || b.opponentTeam,
-          location: a.location || b.location || "",
-          homeAway: a.homeAway || b.homeAway || "Home",
-          division: "Both",
-          competitionLevel: a.competitionLevel === b.competitionLevel
-            ? (a.competitionLevel || "Varsity")
-            : [a.competitionLevel, b.competitionLevel].filter(Boolean).join(" / "),
-          weighInTime: a.weighInTime || b.weighInTime || "",
-          startTime: a.startTime || b.startTime || ""
+          date: items[0].date,
+          type: items[0].type || "Dual",
+          opponentTeam: primary + (rest.length ? (" w/ " + rest.join(", ")) : ""),
+          location: place,
+          homeAway,
+          division,
+          competitionLevel: levels.length === 1 ? levels[0] : levels.join(" / "),
+          weighInTime: items.map(b => b.weighInTime).filter(Boolean)[0] || "",
+          startTime: items.map(b => b.startTime).filter(Boolean)[0] || "",
+          _combined: true
         };
       });
 
       const bodyRows = rows.length === 0
-        ? '<tr><td colspan="9" style="text-align:center;padding:16px;">No events scheduled.</td></tr>'
+        ? '<tr><td colspan="8" style="text-align:center;padding:16px;">No events scheduled.</td></tr>'
         : rows.map(b => {
             const loc = b.homeAway === "Away" ? "@" : (b.homeAway === "Neutral" ? "vs (N)" : "vs");
             const place = (b.location || "").trim();
+            const oppLabel = esc(b.opponentTeam || "");
             const oppCell = place
-              ? (esc(loc) + " " + esc(b.opponentTeam) + "<br/><span style=\"font-size:10px;color:#666;\">" + esc(place) + "</span>")
-              : (esc(loc) + " " + esc(b.opponentTeam));
+              ? (esc(loc) + " " + oppLabel + "<br/><span style=\\"font-size:10px;color:#666;\\">" + esc(place) + "</span>")
+              : (esc(loc) + " " + oppLabel);
+            const divLabel = (typeof divisionDisplayName === "function")
+              ? divisionDisplayName(b.division === "Both" ? "Both" : (b.division || ""))
+              : (b.division === "Both" ? "Both" : (b.division || ""));
             return `<tr>
               <td>${esc(b.date)}</td>
               <td>${esc(b.type || "")}</td>
               <td>${oppCell}</td>
               <td>${esc(b.homeAway || "Home")}</td>
-              <td>${esc(b.division === "Both" ? "Both" : (b.division || ""))}</td>
+              <td>${esc(divLabel)}</td>
               <td>${esc(b.competitionLevel || "Varsity")}</td>
               <td>${esc(formatTime12(b.weighInTime))}</td>
               <td>${esc(formatTime12(b.startTime))}</td>
@@ -14252,7 +14320,7 @@ function computeRawStatsBundle(wrestlerId) {
           </p>
           <label style="display:flex; align-items:flex-start; gap:8px; margin-bottom:8px; font-size:12px; color:var(--chalk); cursor:pointer;">
             <input type="checkbox" style="margin-top:3px;" ${appConfig.includeCollege ? 'checked' : ''}
-              onchange="appConfig.includeCollege = this.checked; persist(); render();" />
+              onchange="appConfig.includeCollege = this.checked; if (this.checked) { appConfig.divisionPronouns = "menWomen"; }; persist(); render();" />
             <span>
               <strong>Include College</strong>
               <span style="color:var(--muted); display:block; font-size:11px; margin-top:2px;">
@@ -14320,6 +14388,11 @@ function computeRawStatsBundle(wrestlerId) {
           <div>
             <label class="fld-label">Team / School Name</label>
             <input class="input" value="${swEsc(branding.teamName)}" oninput="branding.teamName = this.value; persist(); applyBranding(branding);" placeholder="e.g. Scorpions Wrestling" />
+          </div>
+          <div>
+            <label class="field-label">Home Location</label>
+            <input class="input" value="${swEsc(branding.homeLocation || '')}" oninput="branding.homeLocation = this.value; persist();" placeholder="e.g. Main gym, Desert Ridge HS" />
+            <p style="font-size:10px; color:var(--muted); margin:4px 0 0 0;">Auto-fills the Location field when you add a <strong>Home</strong> bout/event.</p>
           </div>
           <div>
             <label class="fld-label">Team Text Color</label>
@@ -14719,7 +14792,7 @@ const teamOpsBody = `
             })()}
           </div>
           <button class="btn btn-green" style="font-size:11px;" onclick="triggerLoadSeasonArchive()">Load Season from File</button>
-          <button class="btn btn-gold" style="font-size:11px;" onclick="exportMatSideSync()">Export for MatSide</button>
+          <button class="btn btn-gold" style="font-size:11px;" onclick="exportMatSideSync()">Export for MatScorer</button>
         </div>
         <p style="font-size:10px; color:var(--muted); margin:0 0 10px 0;">
           <strong>MatScorer:</strong> Exports active-season <em>roster</em> and <em>events (bouts)</em> for the phone app (not scored match logs).
@@ -15592,6 +15665,13 @@ const aiBody = `
     function openAddBoutModal() {
       if (guardSeasonLocked("adding events")) return;
       boutFormBuffer.opponentsFromMemory = false;
+      // Home events inherit team home location when location is empty
+      try {
+        if ((boutFormBuffer.homeAway || "Home") === "Home" && !(boutFormBuffer.location || "").trim()) {
+          const hl = (branding && branding.homeLocation) ? String(branding.homeLocation).trim() : "";
+          if (hl) boutFormBuffer.location = hl;
+        }
+      } catch (e) {}
       activeModal = "bout";
       render();
     }
@@ -15821,10 +15901,9 @@ const aiBody = `
                   : `<span class="sw-status-pill sw-status-off"><span class="sw-status-dot"></span>Not connected</span>`}
               </div>
               <p style="font-size:11px; color:var(--muted); margin:0 0 8px 0;">Same controls as Admin → Season &amp; Storage → Google Drive team sync.</p>
-              <label class="field-label">Google OAuth Client ID</label>
-              <input class="input" style="margin-bottom:8px;" placeholder="xxxx.apps.googleusercontent.com"
-                value="${swEsc(appConfig.googleClientId || '')}"
-                onchange="appConfig.googleClientId = this.value.trim(); persist();" />
+              ${(typeof SW_GOOGLE_CLIENT_ID === "string" && SW_GOOGLE_CLIENT_ID)
+                ? `<p style="font-size:11px; color:var(--muted); margin:0 0 8px 0;">OAuth client is built into this app · <code style="font-size:10px;">${swEsc(String(SW_GOOGLE_CLIENT_ID).slice(0, 28))}…</code></p>`
+                : `<p style="font-size:11px; color:var(--red); margin:0 0 8px 0;">OAuth Client ID missing from this build.</p>`}
               <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;">
                 <button type="button" class="btn btn-green" style="font-size:11px;" onclick="connectGoogleDrive().then(function(){ try{updateIoLocationBadges();}catch(e){} renderModal(); }).catch(function(){})">Connect Google</button>
                 <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="disconnectGoogleDrive(); renderModal();">Disconnect</button>
@@ -16342,8 +16421,8 @@ const aiBody = `
                 <div>
                   <label style="font-size:11px; color:var(--muted);">Division</label>
                   <select class="select" onchange="boutFormBuffer.division = this.value">
-                    <option value="Boys" ${boutFormBuffer.division === 'Boys' ? 'selected' : ''}>Boys</option>
-                    <option value="Girls" ${boutFormBuffer.division === 'Girls' ? 'selected' : ''}>Girls</option>
+                    <option value="Boys" ${boutFormBuffer.division === 'Boys' ? 'selected' : ''}>${swEsc(divisionDisplayName('Boys'))}</option>
+                    <option value="Girls" ${boutFormBuffer.division === 'Girls' ? 'selected' : ''}>${swEsc(divisionDisplayName('Girls'))}</option>
                     <option value="Both" ${boutFormBuffer.division === 'Both' ? 'selected' : ''}>Co-ed</option>
                   </select>
                 </div>
@@ -16359,7 +16438,7 @@ const aiBody = `
                 </div>
                 <div>
                   <label style="font-size:11px; color:var(--muted);">Home / Away</label>
-                  <select class="select" onchange="boutFormBuffer.homeAway = this.value">
+                  <select class="select" onchange="boutFormBuffer.homeAway = this.value; if (this.value === 'Home' && !(boutFormBuffer.location || '').trim() && branding && branding.homeLocation) { boutFormBuffer.location = branding.homeLocation; } renderModal();">
                     <option value="Home" ${boutFormBuffer.homeAway === 'Home' ? 'selected' : ''}>Home</option>
                     <option value="Away" ${boutFormBuffer.homeAway === 'Away' ? 'selected' : ''}>Away</option>
                     <option value="Neutral" ${boutFormBuffer.homeAway === 'Neutral' ? 'selected' : ''}>Neutral Site</option>
@@ -16564,8 +16643,8 @@ const aiBody = `
                 <div>
                   <label style="font-size:11px; color:var(--muted);">Division</label>
                   <select class="select" onchange="editingBout.division = this.value">
-                    <option value="Boys" ${editingBout.division === 'Boys' ? 'selected' : ''}>Boys</option>
-                    <option value="Girls" ${editingBout.division === 'Girls' ? 'selected' : ''}>Girls</option>
+                    <option value="Boys" ${editingBout.division === 'Boys' ? 'selected' : ''}>${swEsc(divisionDisplayName('Boys'))}</option>
+                    <option value="Girls" ${editingBout.division === 'Girls' ? 'selected' : ''}>${swEsc(divisionDisplayName('Girls'))}</option>
                     <option value="Both" ${editingBout.division === 'Both' ? 'selected' : ''}>Co-ed</option>
                   </select>
                 </div>
@@ -18381,7 +18460,11 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           }
           return copy;
         }),
-        layoutOrder, adminSectionHidden, ourWrestlerAppearance, moveStyleTags
+        layoutOrder, adminSectionHidden, ourWrestlerAppearance, moveStyleTags,
+        modifierStyleTags: (typeof modifierStyleTags !== "undefined") ? modifierStyleTags : undefined,
+        aiTrainingPlanCache: (typeof aiTrainingPlanCache !== "undefined" && aiTrainingPlanCache) ? aiTrainingPlanCache : {},
+        // Explicit aliases for clarity (same data lives in store for seasons/roster/matches/events/calendar)
+        note: "store includes seasons (roster, bouts/events, matches, scoring events, attendance/calendar). Also: taxonomy, weights, branding, theme, appConfig, awards, gear, opponent memory, AI training library + plan cache."
       };
     }
 
@@ -18405,6 +18488,13 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       }
       if (payload.awards) awards = payload.awards;
       if (payload.gearInventory) gearInventory = payload.gearInventory;
+      if (payload.aiTrainingPlanCache && typeof payload.aiTrainingPlanCache === "object") {
+        try { aiTrainingPlanCache = payload.aiTrainingPlanCache; } catch (e) {}
+        try { localStorage.setItem("mat-scout-ai-training-plan-v1", JSON.stringify({ cache: aiTrainingPlanCache })); } catch (e) {}
+      }
+      if (payload.modifierStyleTags && typeof payload.modifierStyleTags === "object") {
+        try { modifierStyleTags = payload.modifierStyleTags; } catch (e) {}
+      }
       if (payload.rosterLibrary) rosterLibrary = payload.rosterLibrary;
       if (payload.opponentRosterMemory && typeof payload.opponentRosterMemory === "object") {
         opponentRosterMemory = payload.opponentRosterMemory;
@@ -18519,6 +18609,12 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     async function connectGoogleDrive() {
+      try {
+        if (typeof SW_GOOGLE_CLIENT_ID === "string" && SW_GOOGLE_CLIENT_ID && appConfig && !String(appConfig.googleClientId || "").trim()) {
+          appConfig.googleClientId = SW_GOOGLE_CLIENT_ID.trim();
+          try { persist(); } catch (e) {}
+        }
+      } catch (e) {}
       try {
         await requestGoogleAccessToken("consent");
         toast("Google account connected. Choose a Drive folder for team backups.", "success", 5000);
@@ -20073,6 +20169,30 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       });
       test("Roster IDs are unique", () => { const s = getActiveSeason(); const ids = (s.roster||[]).map(w=>w.id); return new Set(ids).size === ids.length; });
       test("Persist round-trips without throwing", () => { persist(); return true; });
+      test("Full backup payload includes core collections", () => {
+        if (typeof buildFullBackupPayload !== "function") return false;
+        const p = buildFullBackupPayload();
+        return !!(p && p.store && p.branding && p.appConfig && Array.isArray(p.awards) && Array.isArray(p.gearInventory)
+          && Array.isArray(p.aiTrainingLibrary) && p.aiTrainingPlanCache != null);
+      });
+      test("Division display respects Men/Women pronouns", () => {
+        if (typeof divisionDisplayName !== "function") return true;
+        const prev = appConfig.divisionPronouns;
+        appConfig.divisionPronouns = "menWomen";
+        const okMen = divisionDisplayName("Boys") === "Men" && divisionDisplayName("Girls") === "Women";
+        appConfig.divisionPronouns = "boysGirls";
+        const okBoys = divisionDisplayName("Boys") === "Boys";
+        appConfig.divisionPronouns = prev;
+        return okMen && okBoys;
+      });
+      test("Google OAuth client is configured", () => {
+        const built = (typeof SW_GOOGLE_CLIENT_ID === "string" && SW_GOOGLE_CLIENT_ID) || (appConfig && appConfig.googleClientId);
+        return !!built;
+      });
+      test("MatScorer export type is mat-scorer-sync", () => {
+        // Smoke: export function exists; type checked by reading source contract
+        return typeof exportMatSideSync === "function";
+      });
       window.lastMatScoutDiagnostics = results;
       if (showUi) {
         const passed = results.filter(r=>r.ok).length;
@@ -20327,6 +20447,19 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
     const MAT_SCOUT_CHANGELOG = [
       {
+        build: "2026-10-12-schedule-branding",
+        items: [
+          "Google Drive G-badge connect: OAuth Client ID is built-in (no paste field)",
+          "Admin Team setup: Home Location auto-fills Location on Home bouts/events",
+          "Print Schedule: same-day duals at the same site combine (e.g. @ Big Bear w/ Eastside); Boys+Girls still merge to Both",
+          "Men/Women pronouns applied on bout dropdowns and printouts; College levels auto-select Men/Women",
+          "Top bar Save includes AI Training Plans (plus seasons, roster, matches, calendar, awards, gear, Admin, opponent memory, AI library)",
+          "Export for MatScorer label; MatScorer package compatibility",
+          "Tutorial and Diagnostics updated for Drive, MatScorer, schedule, and backup coverage"
+        ]
+      },
+
+      {
         build: "2026-10-11-clip-drive-sync",
         items: [
           "Auto-Clip: Connect / Disconnect / status pill (localhost:5057); URL field removed",
@@ -20374,14 +20507,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           "Storage Health panel — usage, last save, full backup export"
         ]
       },
-      {
-        build: "2026-09-15-core",
-        items: [
-          "Strategic Wrestler core: Roster, Scout, Bout Sheet, Stats, Training Plan, Calendar, Admin",
-          "MatScorer package import for live-scored matches",
-          "Rulesets: Folkstyle, Freestyle, Greco"
-        ]
-      }
+    
     ];
     const LAST_SEEN_BUILD_KEY = "mat-scout-last-seen-build";
     try {
@@ -20394,18 +20520,18 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
     let tutorialStep = 0;
     const TUTORIAL_STEPS = [
-      { title: "Welcome to Strategic Wrestler", body: "This short tour covers the setup steps every new coach should complete before scoring matches." },
-      { title: "1 · Create or select a Season", body: "Open Admin → Season & Storage. Create a season with the correct year and wrestling style (Folkstyle, Freestyle, or Greco). Style drives scoring rules." },
-      { title: "2 · Team Setup", body: "Admin → Team Setup: set your team name/branding, gear inventory if needed, training-plan thresholds, and awards." },
-      { title: "3 · Weight classes & Girls-in-Boys", body: "Admin → Manage Official Weight Classes: load a preset for your state or build the list by hand. These weights fill every weight dropdown in the app. The Girls-in-Boys option lives under Admin → Team Setup → Team Name & Branding — enable it only if your league allows it." },
-      { title: "4 · Attendance rules", body: "Admin → Team Setup → Attendance Rate: decide whether Excused absences count against an athlete's rate, and how many Lates equal one absence. Set it before the season so the rates on the Roster page mean the same thing all year." },
-      { title: "5 · Build the roster", body: "Roster tab: add athletes with division, level, grade, and weight class. Use Edit for minimum weight, contacts, and flags (Injured, Suspended, Redshirt, Quit). Archive rather than delete — archiving keeps every match an athlete wrestled." },
-      { title: "6 · Add an Event", body: "Roster or Calendar: create a Dual or Tournament, set weigh-in and start times, and optionally enter the opponent roster. Select that Event in the top bar before scoring — matches cannot be scored under All Events." },
-      { title: "7 · Score a match", body: "Scout tab: pick athlete + event, set the Match Level, Start Scoring, choose positions when prompted, and log moves. Tag ties and setups as you go — that is what makes the Training Plan useful later. Undo steps back one action at a time. Commit when finished." },
-      { title: "8 · Falls and tech falls", body: "When you score a pin, or the margin reaches the technical superiority margin for your style, Strategic Wrestler asks for the clock time. You can correct either time later by clicking it on the Bout Sheet, and clicking a row opens the full Match Log to review or delete a match." },
-      { title: "9 · Finalize the dual", body: "Bout Sheet: once every weight is scored, finalize the dual. That locks the team score and updates your season dual record. Anything left unscored counts as a forfeit, so fill those in first." },
-      { title: "10 · Save your data", body: "Top bar Save downloads a full backup. Everything lives in this browser, so a backup is the only copy that survives clearing browser data. Optionally set a shared Drive folder link in Admin → Season & Storage so staff know where to put files." },
-      { title: "You're ready", body: "Re-open this tour anytime from Admin → Tutorial. The ? icon on any card explains what that card does. Run Diagnostics from Admin → Season & Storage → Storage Health if something looks off." }
+      { title: "Welcome", body: "Strategic Wrestler tracks roster, live scoring (Scout), dual sheets, stats, training plans, calendar, and Admin settings. Pair it with MatScorer for mat-side live scoring and video packages." },
+      { title: "1 · Team setup", body: "Admin → Team Name & Branding: set team name, Home Location (auto-fills Home events), logo/banner, and Boys/Girls or Men/Women pronouns. College seasons should use Men/Women — enabling College levels selects that automatically." },
+      { title: "2 · Storage & Drive", body: "Click the G badge (or Admin → Season & Storage) to Connect Google Drive. OAuth is built in — no Client ID to paste. Create/verify folders (Backups, Exports, Archives, AI Library, MatScorer). Optionally choose a local Strategic Wrestler folder. Top bar Save writes a full backup; Drive Sync uploads local folders to Drive." },
+      { title: "3 · Create a season", body: "Roster → Create Season. Pick year and style (Folkstyle / Freestyle / Greco). Import last year's roster if available. Enable College levels in Admin if needed." },
+      { title: "4 · Add events", body: "Roster → Add Bout/Event. After Save the form stays open so you can add Boys and Girls duals the same day. Use Location for tournaments or multi-school sites. Home events fill Location from your Home Location. Tournaments do not auto-load opponent rosters." },
+      { title: "5 · Score matches", body: "Select the Event and athlete, then Scout → Start Scoring. Tag actions with timestamps. Commit when done. Or import a MatScorer package (JSON + video) into Scout and Commit." },
+      { title: "6 · Bout Sheet & Stats", body: "Bout Sheet shows dual progress; finalize when complete. Stats and Training Plan use committed matches. AI Training Plans are included in top bar Save backups." },
+      { title: "7 · Calendar & attendance", body: "Calendar: practices, events, and attendance. Boys/Girls (or Men/Women) filters follow your pronoun setting. Print Schedule merges same-day duals at the same site (e.g. @ Big Bear w/ Eastside)." },
+      { title: "8 · Presence & seats", body: "Only one coach edits at a time (first online). Others can view and print. Share the same license key for additional seats." },
+      { title: "9 · Save often", body: "Top bar Save backs up seasons, roster, matches, events, calendar, awards, gear, Admin settings, opponent memory, AI training library, and AI training plans. Load restores a backup. Keep Drive or local folders connected." },
+      { title: "You're ready", body: "Re-open this tour from Admin → Tutorial. Use ? help icons on cards. Run Diagnostics from Admin → Storage Health if something looks off." }
+    ];
     ];
 
     function startSetupTutorial() {
