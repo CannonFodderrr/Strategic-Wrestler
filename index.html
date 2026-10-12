@@ -474,7 +474,7 @@
         </div>
         <div style="display:flex; flex-direction:column; align-items:center; gap:2px;">
           <div style="display:flex; gap:6px; align-items:center; justify-content:center;">
-            <button type="button" class="btn btn-toolbar" style="background:var(--panelLine); color:var(--chalk);" onclick="syncLocalFoldersToGoogleDrive()" title="Upload local Strategic Wrestler folders (Backups, Exports, Archives, AI Library, MatSide) to the matching Google Drive folders">Drive Sync</button>
+            <button type="button" class="btn btn-toolbar" style="background:var(--panelLine); color:var(--chalk);" onclick="syncLocalFoldersToGoogleDrive()" title="Upload local Strategic Wrestler folders (Backups, Exports, Archives, AI Library, MatScorer) to the matching Google Drive folders">Drive Sync</button>
             <button type="button" class="btn btn-gold btn-toolbar" onclick="loadSharedSeasonData()" title="Load full backup (Default Save/Upload Location)">Load</button>
             <button type="button" class="btn btn-green btn-toolbar" onclick="saveSharedSeasonData()" title="Save full backup (Default Save/Upload Location)">Save</button>
           </div>
@@ -790,7 +790,7 @@
     const TRIAL_DAYS = 90;
     /** GitHub owner/repo for in-app bug reports (Issues). Change to your real repo. */
     const SW_BUG_REPORT_GITHUB_REPO = "CannonFodderrr/Strategic-Wrestler";
-    /** MatSide issues go here (change if your MatSide repo path differs). */
+    /** MatScorer issues go here (change if your MatScorer repo path differs). */
     const MATSIDE_BUG_REPORT_GITHUB_REPO = "CannonFodderrr/Mat-Scorer";
     /**
      * Supabase license server (hosted by product owner).
@@ -2145,7 +2145,7 @@
       googleClientId: "",
       googleDriveFolderId: "",
       googleDriveFolderName: "",
-      /** Separate Drive folder for exports (MatSide packages, CSV, etc.) */
+      /** Separate Drive folder for exports (MatScorer packages, CSV, etc.) */
       googleDriveExportsFolderId: "",
       googleDriveExportsFolderName: "",
       /** Season archive JSON files */
@@ -2154,7 +2154,7 @@
       /** AI training library JSON / Kaggle exports */
       googleDriveAiLibraryFolderId: "",
       googleDriveAiLibraryFolderName: "",
-      /** MatSide score packages + match videos */
+      /** MatScorer score packages + match videos */
       googleDriveMatSideFolderId: "",
       googleDriveMatSideFolderName: "",
       /** Parent folder on Drive: "Strategic Wrestler" */
@@ -2507,6 +2507,11 @@
             autoClipServerUrl: parsed.autoClipServerUrl || "http://localhost:5057",
             pruneBackupsAfter5Days: parsed.pruneBackupsAfter5Days !== false,
             pruneBackupsKeepCount: Math.max(1, parseInt(parsed.pruneBackupsKeepCount, 10) || 5),
+            googleDriveMatSideFolderName: (function () {
+              const n = parsed.googleDriveMatSideFolderName || appConfig.googleDriveMatSideFolderName || "";
+              if (!n || n === "MatSide") return "MatScorer";
+              return n;
+            })(),
             allowGirlsInBoysEvents: !!parsed.allowGirlsInBoysEvents,
             latesPerAbsence: (parsed.latesPerAbsence != null ? Number(parsed.latesPerAbsence) : 2),
             countLatesInAttendanceRate: parsed.countLatesInAttendanceRate !== false,
@@ -3152,12 +3157,13 @@
     }
 
 
-    /** Export active season roster + bouts for MatSide live scoring */
+    /** Export active season roster + bouts for MatScorer live scoring */
     function exportMatSideSync() {
       const season = getActiveSeason();
       if (!season) return toast("No active season.");
       const payload = {
-        type: "mat-side-sync",
+        type: "mat-scorer-sync",
+        legacyType: "mat-side-sync",
         version: 1,
         exportedAt: new Date().toISOString(),
         teamName: (branding && branding.teamName) || "",
@@ -3197,14 +3203,14 @@
         }))
       };
       const safe = String(season.name || "season").replace(/[^a-z0-9-_]+/gi, "_").slice(0, 40);
-      const fname = "mat-side-sync_" + safe + ".json";
+      const fname = "mat-scorer-sync_" + safe + ".json";
       const body = JSON.stringify(payload, null, 2);
       const nOpen = (payload.bouts || []).length;
       const nClosed = (season.bouts || []).filter(b => b.finalized).length;
       if (typeof downloadOrDriveExport === "function") {
         downloadOrDriveExport(fname, body, "application/json", "exports").then(r => {
           toast(
-            "Exported for MatSide: " + (payload.roster || []).length + " athletes, " +
+            "Exported for MatScorer: " + (payload.roster || []).length + " athletes, " +
             nOpen + " open event(s)" +
             (nClosed ? (" (" + nClosed + " finalized skipped)") : "") +
             (r && r.target && String(r.target).indexOf("drive") >= 0 ? " → Drive" : " → local"),
@@ -3223,11 +3229,11 @@
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      toast("MatSide export downloaded (" + (payload.roster || []).length + " athletes, " + (payload.bouts || []).length + " events).", "success");
+      toast("MatScorer export downloaded (" + (payload.roster || []).length + " athletes, " + (payload.bouts || []).length + " events).", "success");
     }
 
     let pendingMatSidePackage = null; // last imported package awaiting optional video
-    /** Set during Drive MatSide JSON import so video can be auto-pulled from the same event folder. */
+    /** Set during Drive MatScorer JSON import so video can be auto-pulled from the same event folder. */
     let lastMatSideImportMeta = null; // { jsonName, folderId, folderName, fileId }
 
     function matSideVideoBaseCandidates(data, jsonName) {
@@ -3298,7 +3304,7 @@
     }
 
     function triggerImportMatSidePackage() {
-      if (guardSeasonLocked("importing MatSide packages")) return;
+      if (guardSeasonLocked("importing MatScorer packages")) return;
       const handleData = (data, meta) => {
         try {
           meta = meta || {};
@@ -3322,11 +3328,11 @@
           // Fire-and-forget auto attach after import sets pendingMatSidePackage
           tryAutoAttachMatSideVideo();
         } catch (err) {
-          toast("Could not import MatSide package: " + (err.message || err), "error");
+          toast("Could not import MatScorer package: " + (err.message || err), "error");
         }
       };
       if (typeof importJsonFromDriveOrFile === "function") {
-        importJsonFromDriveOrFile("matside", "MatSide package", handleData);
+        importJsonFromDriveOrFile("matside", "MatScorer package", handleData);
         return;
       }
       const input = document.createElement("input");
@@ -3338,7 +3344,7 @@
         const reader = new FileReader();
         reader.onload = () => {
           try { handleData(JSON.parse(reader.result)); }
-          catch (err) { toast("Could not import MatSide package: " + (err.message || err)); }
+          catch (err) { toast("Could not import MatScorer package: " + (err.message || err)); }
         };
         reader.readAsText(file);
       };
@@ -3353,10 +3359,10 @@
       const chosen = file.name || "";
       if (!opts.silent && expected && fileBaseName(expected) && fileBaseName(chosen) !== fileBaseName(expected)) {
         const ok = confirm(
-          "Video filename does not match the MatSide package.\n\n" +
+          "Video filename does not match the MatScorer package.\n\n" +
           "Expected: " + expected + "\n" +
           "Selected: " + chosen + "\n\n" +
-          "MatSide uses the same base name for JSON and video. Continue with this video anyway?"
+          "MatScorer uses the same base name for JSON and video. Continue with this video anyway?"
         );
         if (!ok) return;
       }
@@ -3382,7 +3388,7 @@
     }
     function triggerAttachMatSideVideo() {
       if (!pendingMatSidePackage || !pendingMatSidePackage.matchId) {
-        return toast("Import a MatSide score JSON first, then attach the video.");
+        return toast("Import a MatScorer score JSON first, then attach the video.");
       }
       if (typeof importVideoFromDriveOrFile === "function") {
         importVideoFromDriveOrFile("matside", pendingMatSidePackage.expectedVideoName || "", applyMatSideVideoFile);
@@ -3433,7 +3439,7 @@
       return m + ":" + String(whole).padStart(2, "0");
     }
 
-    /** Pull events array from common MatSide / companion shapes. */
+    /** Pull events array from common MatScorer / companion shapes. */
     function extractMatSideEvents(data) {
       if (!data || typeof data !== "object") return [];
       const candidates = [
@@ -3493,11 +3499,11 @@
       const categoryFinal = category;
       const isPenalty = /penalty|dq|caution/i.test(String(categoryFinal || ""));
       /*
-       * MatSide live scoring semantics differ from Strategic Wrestler:
-       *   MatSide: direction=defense + outcome=success + points>0  → opponent scored
+       * MatScorer live scoring semantics differ from Strategic Wrestler:
+       *   MatScorer: direction=defense + outcome=success + points>0  → opponent scored
        *   SW:      direction=defense + outcome=fail               → opponent scored
        *            direction=defense + outcome=success            → we defended (no opp points)
-       * Translate MatSide scoring rows into SW semantics on import.
+       * Translate MatScorer scoring rows into SW semantics on import.
        */
       if (!isPenalty && dir === "defense" && outcome === "success" && points > 0) {
         outcome = "fail";
@@ -3522,14 +3528,15 @@
 
     function importMatSidePackage(data) {
       if (!data || typeof data !== "object") throw new Error("Invalid file.");
-      // Accept mat-side-package, or sync-only (warn)
-      if (data.type === "mat-side-sync") {
-        throw new Error("This file is a roster/event sync export for MatSide, not a scored match package.\n\nUse a mat-side_*.json package from End Match on MatSide.");
+      // Accept mat-scorer-package / mat-side-package; reject sync-only files
+      if (data.type === "mat-side-sync" || data.type === "mat-scorer-sync") {
+        throw new Error("This file is a roster/event sync export for MatScorer, not a scored match package.\n\nUse a match package from End Match on MatScorer (type mat-scorer-package).");
       }
       const eventsIn = extractMatSideEvents(data);
       const hasMatch = !!(data.match || data.bout || data.wrestlerName || data.opponent);
-      if (data.type && data.type !== "mat-side-package" && !(hasMatch || eventsIn.length)) {
-        throw new Error("Not a MatSide match package (expected type mat-side-package or match + events).");
+      const okTypes = { "mat-side-package": 1, "mat-scorer-package": 1 };
+      if (data.type && !okTypes[data.type] && !(hasMatch || eventsIn.length)) {
+        throw new Error("Not a MatScorer match package (expected type mat-scorer-package or mat-side-package, or match + events).");
       }
       const season = getActiveSeason();
       if (!season) throw new Error("No active season.");
@@ -3556,19 +3563,19 @@
         )) {
           wrestler = activeW;
         } else {
-          throw new Error("Wrestler not found on roster. Add/select the athlete, or export a fresh MatSide sync from this season first.");
+          throw new Error("Wrestler not found on roster. Add/select the athlete, or export a fresh MatScorer sync from this season first.");
         }
       }
 
-      // Duplicate guards: same MatSide package already imported, or varsity match already logged for this wrestler/event
+      // Duplicate guards: same MatScorer package already imported, or varsity match already logged for this wrestler/event
       const packageId = data.packageId || matchMeta.packageId || null;
       if (packageId) {
         const alreadyPkg = (season.matches || []).some(m => m.matSidePackageId && String(m.matSidePackageId) === String(packageId));
         if (alreadyPkg) {
-          throw new Error("This MatSide package was already imported and saved (packageId: " + packageId + ").");
+          throw new Error("This MatScorer package was already imported and saved (packageId: " + packageId + ").");
         }
         if (activeMatch && activeMatch.matSidePackageId && String(activeMatch.matSidePackageId) === String(packageId)) {
-          throw new Error("This MatSide package is already loaded in the current Scout review.");
+          throw new Error("This MatScorer package is already loaded in the current Scout review.");
         }
       }
       const importDate = String(matchMeta.date || (data.bout && data.bout.date) || "").slice(0, 10);
@@ -3624,7 +3631,7 @@
           division: boutMeta.division || wrestler.division || "Boys",
           competitionLevel: matchMeta.level || boutMeta.competitionLevel || "Varsity",
           homeAway: boutMeta.homeAway || "Home",
-          opponentTeam: boutMeta.opponentTeam || "MatSide Import",
+          opponentTeam: boutMeta.opponentTeam || "MatScorer Import",
           opponentRoster: [],
           finalized: false,
           source: "mat-side-import"
@@ -3638,7 +3645,7 @@
       if (activeMatch && (activeMatch.events || []).length) {
         const ok = confirm(
           "You already have an open match in Scout with " + (activeMatch.events || []).length + " event(s).\n\n" +
-          "Replace it with this MatSide import? (Uncommitted work will be discarded.)"
+          "Replace it with this MatScorer import? (Uncommitted work will be discarded.)"
         );
         if (!ok) return;
       }
@@ -3705,7 +3712,7 @@
         matSidePackageId: data.packageId || null,
         ourPoints: matchMeta.ourPoints,
         oppPoints: matchMeta.oppPoints,
-        reviewFromMatSide: true
+        reviewFromMatSide: true, reviewFromMatScorer: true
       };
 
       try { clearUndoState(); } catch (e) {}
@@ -3736,9 +3743,9 @@
       render();
 
       if (imported === 0) {
-        toast("MatSide imported — no scoring events in file." + (skipped ? (" (" + skipped + " rows skipped)") : ""), "error", 5000);
+        toast("MatScorer imported — no scoring events in file." + (skipped ? (" (" + skipped + " rows skipped)") : ""), "error", 5000);
       } else {
-        toast("MatSide: " + imported + " event(s) in Scout — review, then Commit.", "success", 4500);
+        toast("MatScorer: " + imported + " event(s) in Scout — review, then Commit.", "success", 4500);
       }
     }
 
@@ -4733,7 +4740,18 @@
       // Always prefer the loaded event division over the active athlete
       if (bout) {
         if (bout.division === "Girls") return weightClasses.Girls || [];
-        // Boys or Both duals use Boys NFHS slots for dual-meet weight rows
+        if (bout.division === "Both" || /^co-?ed$/i.test(String(bout.division || ""))) {
+          const b = (weightClasses.Boys || []).map(String);
+          const g = (weightClasses.Girls || []).map(String);
+          const seen = {};
+          const out = [];
+          b.concat(g).forEach(function (w) {
+            if (!seen[w]) { seen[w] = true; out.push(w); }
+          });
+          out.sort(function (a, c) { return (Number(a) || 0) - (Number(c) || 0); });
+          return out;
+        }
+        // Boys duals use Boys weight slots
         return weightClasses.Boys || [];
       }
       const wrestler = getActiveWrestler();
@@ -5663,7 +5681,7 @@
       "roster_print": "Pick what to print from the dropdown, then press Print. Roster is the basic weight-class list; Expanded Roster adds contact info; Roster Changes is the add/drop/archive audit trail for the season; Gear Inventory lists every item issued and outstanding. Printing follows the Division and Level filters currently set on this page, so narrow those first if you only want part of the team.",
       "roster_athletes": "Add and manage athletes on your active roster. Use the Scout, Stats, or Bout Sheet dropdowns to set an athlete as your active focus — the Team Roster list below is for managing details, not selecting. Click 'Edit' on an athlete to set contact info (wrestler + 2 parent phone/email slots) and status flags: INJ (injured), SUSP (suspended), QUIT (no longer on team). The colored pills under each athlete's name show attendance: red = Absences, gold = Excused and Late counts (with any injury-related count in parentheses), and the right-most pill is their overall present rate — green is 90%+, gold is 75-89%, red is below 75%.",
       "season_naming": "Season display name is built as: optional Custom Season Name + Year + Wrestling Style. Year can be a single year (2026) or overlapping years (2026-2027). Example: custom 'Winter' + year '2026-2027' + Folkstyle → 'Winter 2026-2027 Folkstyle'. If custom name is blank, the name is just '2026-2027 Folkstyle'.",
-      "calendar_tab": "Click the 📅 icon to add a month tab, then click any day to take attendance, create a dual/tournament (same as Roster + Add Bout), or add a custom calendar note. Every wrestler starts each day as unmarked/unknown — use 'Mark All Present' for a normal practice day, then adjust exceptions, or mark athletes individually. A day's attendance snapshot (e.g. '8/10 in attendance - 1 exc, 1 unk') only appears once at least one wrestler has been marked for that day. Boys-only events show blue, Girls-only show pink, and Both show purple. Use the Boys/Girls/Both dropdown in the attendance list to filter who's shown, and type a last name in the jump box to scroll straight to that athlete.",
+      "calendar_tab": "Click the 📅 icon to add a month tab, then click any day to take attendance, create a dual/tournament (same as Roster + Add Bout), or add a custom calendar note. Every wrestler starts each day as unmarked/unknown — use 'Mark All Present' for a normal practice day, then adjust exceptions, or mark athletes individually. A day's attendance snapshot (e.g. '8/10 in attendance - 1 exc, 1 unk') only appears once at least one wrestler has been marked for that day. Boys-only events show blue, Girls-only show pink, and Co-ed show purple. Use the Boys/Girls/Both dropdown in the attendance list to filter who's shown, and type a last name in the jump box to scroll straight to that athlete.",
       "roster_events": "Schedule dual meets and tournaments. Set the date, type, division, and competition level, then use the clock fields for weigh-in and match start times. Adding an opponent roster here is optional but recommended \u2014 those names become selectable opponents on the Scout page, so you are not typing them mid-match. Once created, an event scopes every stat view: pick it to see results against one opponent, or leave it on the season for cumulative totals.",
       "scout_manual": "Interactive real-time scoring pad. Track offensive and defensive executions, set position choices at period breaks, and tag ties, setups, and finishes for full root-cause analysis. Keyboard (Scout tab): Space play/pause · J / ← rewind 3s · L / → forward 3s · [ ] frame step 0.1s · 1/2/3 set period P1/P2/P3. Timestamps use tenths (MM:SS.s) for sharper auto-clips.",
       "scout_modifiers": "Modifiers record ties/setups, finishes, and rides per wrestler. Apply to Our (green) or Opp (red). Logged as Opp: … Our: … so coaches and AI can tell who did what. Switch tabs for Ties, Finishes, and Rides.",
@@ -5685,7 +5703,7 @@
       "admin_taxonomy": "The move taxonomy is the list of techniques available on the scoring pad, grouped by category and subcategory. Add moves your team drills so scoring matches your language, and remove ones you never use to keep the pad uncluttered. Changes apply immediately to the Scout page.",
       "roster_edit_athlete": "Set weight class, minimum weight, grade, and competition level, plus contact info for the athlete and up to two parents or guardians. Status flags mark an athlete as injured (INJ), suspended (SUSP), quit (QUIT), or redshirt (RS) \u2014 flagged athletes stay on the roster and keep their history but are visually separated in lists and print-outs. Archiving removes an athlete from active views without deleting any of their match data.",
       "scout_log": "Every scored action in order, with a timestamp in tenths of a second. Click an entry to edit the move, direction, or modifiers if you mis-tagged something live. Undo steps back one action at a time, newest first. Timestamps are what drive AI clip extraction later, so nudging one to the exact moment of the shot pays off if you plan to use video analysis.",
-      "scout_video": "Load footage three ways: upload a local video file, paste a YouTube URL, or import a scored match from the MatSide phone app as JSON and attach the recording to it. With video loaded, every event you tag gets stamped against the playhead, which is what makes clip review and AI training possible.",
+      "scout_video": "Load footage three ways: upload a local video file, paste a YouTube URL, or import a scored match from the MatScorer phone app as JSON and attach the recording to it. With video loaded, every event you tag gets stamped against the playhead, which is what makes clip review and AI training possible.",
       "license_trial": "The app runs on a 90-day trial from first launch in each browser. After that, scoring, committing matches, and adding athletes are locked until you enter an activation key. Keys are verified offline, so no internet connection is needed to activate.",
       "calendar_day": "Take attendance, schedule an event, or leave a note for this date. Every wrestler starts unmarked \u2014 use Mark All Present for a normal practice and then adjust exceptions, which is far faster than marking individually. Lates are weighted, not free: on the Admin page you set how many lates equal one absence, so if that is set to 3, three lates subtract the same from an athlete's rate as a single absence, and a late is never double-counted as an absence. Setting it to 0 leaves lates out of the rate entirely while still recording them. Whether Excused absences count against the rate is also an Admin setting.",
       "sheet_varsity_dual": "Each row is one match. Click anywhere on a row to open its full Match Log \u2014 that is where you review every scored action and delete a match outright if it was scored on the wrong athlete or needs to be rescored from scratch. Click directly on the result text to edit a time without opening the log: pin times and technical fall times are both editable that way. Team points are calculated from the result and roll up into the dual score automatically, so correcting a result here corrects the team score too."
@@ -6978,13 +6996,13 @@
               </div>
             </div>
             <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--panelLine);">
-              <div class="sec-label">MatSide Live Package</div>
+              <div class="sec-label">MatScorer Live Package</div>
               <p style="font-size:11px; color:var(--muted); margin:0 0 8px 0;">
-                Import a scored match from the MatSide phone app (JSON), then attach the recording.
+                Import a scored match from the MatScorer phone app (JSON), then attach the recording.
               </p>
               <div style="display:flex; flex-wrap:wrap; gap:6px;">
-                <button class="btn btn-gold" style="font-size:11px;" onclick="triggerImportMatSidePackage()">Import MatSide JSON File</button>
-                <button class="btn btn-gold" style="font-size:11px;" onclick="triggerAttachMatSideVideo()">Attach MatSide Video</button>
+                <button class="btn btn-gold" style="font-size:11px;" onclick="triggerImportMatSidePackage()">Import MatScorer JSON File</button>
+                <button class="btn btn-gold" style="font-size:11px;" onclick="triggerAttachMatSideVideo()">Attach MatScorer Video</button>
               </div>
             </div>
           </div>
@@ -7659,9 +7677,9 @@
             </span>
           </label>
 
-          ${activeMatch && activeMatch.reviewFromMatSide ? `
+          ${activeMatch && (activeMatch.reviewFromMatSide || activeMatch.reviewFromMatScorer) ? `
           <div style="background:var(--goldDim); border:1px solid var(--gold); border-radius:6px; padding:8px 10px; margin-bottom:10px; font-size:11px; color:var(--chalk); line-height:1.4;">
-            <strong style="color:var(--gold);">MatSide review</strong> — Events are in Scout only. They will not appear on the Bout Sheet or Stats until you
+            <strong style="color:var(--gold);">MatScorer review</strong> — Events are in Scout only. They will not appear on the Bout Sheet or Stats until you
             <strong>Save &amp; Commit</strong>. Edit modifiers, mark failed shots, then commit when ready.
           </div>` : ""}
           <div class="grid-2">
@@ -8616,19 +8634,23 @@
       if (bout && bout.finalized) return;
       if (isSeasonLocked()) return;
 
-      // Girls in Boys events: require Admin opt-in
-      if (bout && bout.division === "Boys" && activeW.division === "Girls" && !appConfig.allowGirlsInBoysEvents) {
+      // Co-ed (Both): boys and girls may wrestle in the same event
+      const boutDiv = bout && bout.division ? String(bout.division) : "";
+      const isCoedEvent = /^both$/i.test(boutDiv) || /^co-?ed$/i.test(boutDiv);
+      // Girls in Boys-only events: require Admin opt-in
+      if (bout && bout.division === "Boys" && !isCoedEvent && activeW.division === "Girls" && !appConfig.allowGirlsInBoysEvents) {
         toast(
           activeW.name + " is rostered as Girls, but this event is a Boys dual/tournament.\n\n" +
-          "To allow Girls to wrestle in Boys events, enable the option in Admin → Manage Official Weight Classes."
+          "To allow Girls to wrestle in Boys events, enable the option in Admin → Manage Official Weight Classes.\n\n" +
+          "Or create a Co-ed event so boys and girls can compete together."
         );
         return;
       }
-      // Boys never compete in Girls events
-      if (bout && bout.division === "Girls" && activeW.division === "Boys") {
+      // Boys never compete in Girls-only events (Co-ed is OK)
+      if (bout && bout.division === "Girls" && !isCoedEvent && activeW.division === "Boys") {
         toast(
           activeW.name + " is rostered as Boys, but this event is a Girls dual/tournament.\n\n" +
-          "Boys cannot be scored in Girls events."
+          "Boys cannot be scored in Girls-only events. Use a Co-ed event for mixed competition."
         );
         return;
       }
@@ -9834,34 +9856,71 @@
         if (typeof ensureGoogleDriveFolderStructure === "function") {
           try { await ensureGoogleDriveFolderStructure(); } catch (e) {}
         }
-        const folder = typeof getDriveFolderForPurpose === "function" ? getDriveFolderForPurpose("aiLibrary") : null;
-        if (!folder || !folder.id) return " Clips on PC; Drive AI Library folder not set.";
+        const aiRoot = typeof getDriveFolderForPurpose === "function" ? getDriveFolderForPurpose("aiLibrary") : null;
+        if (!aiRoot || !aiRoot.id) return " Clips on PC; Drive AI Library folder not set.";
+        // Mirror local layout: AI Library/Clips/<match>/… and AI Library/labels/…
+        const clipsRoot = await findOrCreateGoogleDriveFolder("Clips", aiRoot.id);
+        const labelsRoot = await findOrCreateGoogleDriveFolder("labels", aiRoot.id);
         const base = getClipServerUrl();
         let uploaded = 0;
+        const matchFolders = {}; // local match folder name -> drive folder id
+
         for (let i = 0; i < clipResult.clips.length; i++) {
           const rel = clipResult.clips[i];
           if (!rel) continue;
+          // rel like "Clips/match-folder/file.mp4" or "match-folder/file.mp4"
+          const parts = String(rel).replace(/\\/g, "/").split("/").filter(Boolean);
+          let matchName = "match";
+          let fname = parts[parts.length - 1] || ("clip_" + i + ".mp4");
+          if (parts.length >= 2) {
+            // drop leading "Clips" if present
+            const start = (/^clips$/i.test(parts[0]) ? 1 : 0);
+            if (parts.length - start >= 2) matchName = parts[parts.length - 2];
+            else if (parts.length - start === 1) matchName = "match";
+          }
+          if (!matchFolders[matchName]) {
+            const sub = await findOrCreateGoogleDriveFolder(matchName, clipsRoot.id);
+            matchFolders[matchName] = sub.id;
+          }
           const fileUrl = base + "/clip/file?rel=" + encodeURIComponent(rel);
           const resp = await fetch(fileUrl);
           if (!resp.ok) continue;
           const blob = await resp.blob();
-          const parts = String(rel).split(/[/\\]/);
-          const fname = parts[parts.length - 1] || ("clip_" + i + ".mp4");
-          // Preserve match subfolder in name when possible
-          const matchFolder = parts.length > 1 ? parts[parts.length - 2] : "";
-          const driveName = matchFolder ? (matchFolder + "__" + fname) : fname;
-          await uploadBlobToGoogleDrive(folder.id, driveName, blob, blob.type || "video/mp4");
+          await uploadBlobToGoogleDrive(matchFolders[matchName], fname, blob, blob.type || "video/mp4");
           uploaded++;
         }
-        // Also try labels jsonl snippet is optional
-        return uploaded
-          ? (" Also uploaded " + uploaded + " clip(s) to Google Drive → " + (folder.name || "AI Library") + ".")
-          : " Clips on PC; Drive upload found no fetchable files.";
+
+        // Labels: per-match JSON + shared training_data.jsonl when present on clip server
+        let labelsUp = 0;
+        const labelCandidates = [];
+        Object.keys(matchFolders).forEach(function (m) {
+          labelCandidates.push("labels/" + m + ".json");
+        });
+        labelCandidates.push("labels/training_data.jsonl");
+        for (let j = 0; j < labelCandidates.length; j++) {
+          const relL = labelCandidates[j];
+          try {
+            const respL = await fetch(base + "/clip/file?rel=" + encodeURIComponent(relL));
+            if (!respL.ok) continue;
+            const blobL = await respL.blob();
+            const lname = relL.split("/").pop();
+            await uploadBlobToGoogleDrive(labelsRoot.id, lname, blobL, blobL.type || "application/json");
+            labelsUp++;
+          } catch (eL) {
+            console.warn("label mirror", relL, eL);
+          }
+        }
+
+        return (
+          " Drive: " + uploaded + " clip(s) → AI Library/Clips/…" +
+          (labelsUp ? ("; " + labelsUp + " label file(s) → AI Library/labels/") : "") + "."
+        );
       } catch (e) {
         console.warn("mirror clips to Drive", e);
         return " Clips on PC; Drive upload failed: " + (e.message || e);
       }
     }
+
 
     /** Fire-and-forget POST of a just-committed match to the local Python clip server. */
     async function postMatchToClipServer(example) {
@@ -10105,7 +10164,7 @@
     }
 
     function discardMatch() {
-      if (confirm("Discard this scoring session without adding to stats?\n\nImported MatSide review data will be discarded and will not appear on the Bout Sheet or Stats.")) {
+      if (confirm("Discard this scoring session without adding to stats?\n\nImported MatScorer review data will be discarded and will not appear on the Bout Sheet or Stats.")) {
         activeMatch = null;
         selectedPrimaryCat = null;
         selectedSubCat = null;
@@ -14520,12 +14579,12 @@ const teamOpsBody = `
               <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="disconnectGoogleDrive()">Disconnect</button>
             </div>
             <label class="field-label">Default Save/Upload Location</label>
-            <select class="select" style="margin-bottom:10px;" onchange="appConfig.downloadTarget = this.value; persist(); try { render(); } catch (e) {} toast(this.value === 'drive' ? 'Save, Load, MatSide import/export, and Load Season use Google Drive when connected.' : 'Save, Load, MatSide import/export, and Load Season use local hard drive only.', 'info', 5000);">
+            <select class="select" style="margin-bottom:10px;" onchange="appConfig.downloadTarget = this.value; persist(); try { render(); } catch (e) {} toast(this.value === 'drive' ? 'Save, Load, MatScorer import/export, and Load Season use Google Drive when connected.' : 'Save, Load, MatScorer import/export, and Load Season use local hard drive only.', 'info', 5000);">
               <option value="drive" ${(appConfig.downloadTarget || 'drive') === 'drive' ? 'selected' : ''}>Google Drive (default)</option>
               <option value="local" ${appConfig.downloadTarget === 'local' ? 'selected' : ''}>Hard drive (local only)</option>
             </select>
             <p style="font-size:10px; color:var(--muted); margin:0 0 10px 0;">
-              Controls <strong>Save</strong>, <strong>Load</strong>, <strong>Load Season from File</strong>, MatSide JSON/video import, and exports.
+              Controls <strong>Save</strong>, <strong>Load</strong>, <strong>Load Season from File</strong>, MatScorer JSON/video import, and exports.
               If Drive is selected but you are not connected, you get a warning and may continue locally.
             </p>
             <div style="margin:10px 0 12px 0; padding:10px; background:var(--mat); border:1px solid var(--panelLine); border-radius:6px;">
@@ -14542,7 +14601,7 @@ const teamOpsBody = `
               </p>
               <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">
                 Choose a parent folder (e.g. Documents). The app creates <strong>Strategic Wrestler</strong> inside it, then:
-                <strong>Backups</strong>, <strong>Exports</strong>, <strong>Season Archives</strong>, <strong>AI Library</strong>, <strong>MatSide</strong>.
+                <strong>Backups</strong>, <strong>Exports</strong>, <strong>Season Archives</strong>, <strong>AI Library</strong>, <strong>MatScorer</strong>.
                 If those folders already exist, they are reused.
               </p>
               <div style="display:flex; flex-wrap:wrap; gap:6px;">
@@ -14554,7 +14613,7 @@ const teamOpsBody = `
             <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">
               Standard layout:
               <strong style="color:var(--chalk);">Strategic Wrestler</strong> /
-              Backups · Exports · Season Archives · AI Library · MatSide
+              Backups · Exports · Season Archives · AI Library · MatScorer
             </p>
             <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
               <button type="button" class="btn btn-green" style="font-size:11px;" onclick="ensureGoogleDriveFolderStructure()">Create / verify Google Drive folders</button>
@@ -14572,7 +14631,7 @@ const teamOpsBody = `
             <p style="font-size:10px; color:var(--muted); margin:0 0 4px 0;">
               <strong style="color:var(--gold);">Exports:</strong>
               <strong style="color:var(--chalk);">${swEsc(appConfig.googleDriveExportsFolderName || "Not set")}</strong>
-              <span style="opacity:0.7;"> — MatSide export, CSV / text downloads</span>
+              <span style="opacity:0.7;"> — MatScorer export, CSV / text downloads</span>
             </p>
             <p style="font-size:10px; color:var(--muted); margin:0 0 4px 0;">
               <strong style="color:var(--gold);">Season Archives:</strong>
@@ -14585,7 +14644,7 @@ const teamOpsBody = `
               <span style="opacity:0.7;"> — Export / Import Library JSON &amp; Kaggle</span>
             </p>
             <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">
-              <strong style="color:var(--gold);">MatSide:</strong>
+              <strong style="color:var(--gold);">MatScorer:</strong>
               <strong style="color:var(--chalk);">${swEsc(appConfig.googleDriveMatSideFolderName || "Not set")}</strong>
               <span style="opacity:0.7;"> — Root folder; Scout import opens the subfolder matching the active event</span>
             </p>
@@ -14609,8 +14668,8 @@ const teamOpsBody = `
           <button class="btn btn-gold" style="font-size:11px;" onclick="exportMatSideSync()">Export for MatSide</button>
         </div>
         <p style="font-size:10px; color:var(--muted); margin:0 0 10px 0;">
-          <strong>MatSide:</strong> Exports active-season <em>roster</em> and <em>events (bouts)</em> for the phone app (not scored match logs).
-          Import MatSide score JSON + video from the <strong>Scout</strong> page after a dual.
+          <strong>MatScorer:</strong> Exports active-season <em>roster</em> and <em>events (bouts)</em> for the phone app (not scored match logs).
+          Import MatScorer score JSON + video from the <strong>Scout</strong> page after a dual.
         </p>
         <div class="sub-label">Live Seasons</div>
         ${store.seasons.map(s => `
@@ -15779,7 +15838,7 @@ const aiBody = `
               <label class="field-label">Product</label>
               <select id="bug-report-product" class="select" style="margin-bottom:8px;">
                 <option value="Strategic Wrestler" selected>Strategic Wrestler</option>
-                <option value="MatSide">MatSide</option>
+                <option value="MatScorer">MatScorer</option>
               </select>
               <label class="field-label">Type</label>
               <select id="bug-report-type" class="select" style="margin-bottom:8px;">
@@ -16100,7 +16159,7 @@ const aiBody = `
               ${bouts.length ? `<div style="font-size:11px; margin-bottom:6px; display:flex; flex-wrap:wrap; gap:6px;">
                 ${bouts.map(b => {
                   const col = eventDivisionColor(b.division);
-                  const lab = b.division === "Boys" ? "Boys" : b.division === "Girls" ? "Girls" : b.division === "Both" ? "Both" : (b.division || "");
+                  const lab = b.division === "Boys" ? "Boys" : b.division === "Girls" ? "Girls" : b.division === "Both" ? "Co-ed" : (b.division || "");
                   return `<button type="button" class="btn" style="font-size:11px; padding:3px 8px; background:transparent; border:1px solid ${swEsc(col)}; color:${swEsc(col)}; cursor:pointer;" title="Click to edit bout" onclick="openEditBoutFromCalendar('${swJs(b.id)}')"><span style="opacity:0.85; font-weight:800;">${swEsc(lab)}</span> · ${swEsc(b.type)}: ${swEsc(b.opponentTeam || 'Event')}</button>`;
                 }).join('')}
               </div>` : ''}
@@ -16113,7 +16172,7 @@ const aiBody = `
                   <select class="select" style="width:auto; margin:0; font-size:11px;" title="Show Boys, Girls, or Both" onchange="calendarAttDivisionFilter = this.value; renderModal();">
                     <option value="Boys" ${calendarAttDivisionFilter === 'Boys' ? 'selected' : ''}>Boys</option>
                     <option value="Girls" ${calendarAttDivisionFilter === 'Girls' ? 'selected' : ''}>Girls</option>
-                    <option value="Both" ${calendarAttDivisionFilter === 'Both' ? 'selected' : ''}>Both</option>
+                    <option value="Both" ${calendarAttDivisionFilter === 'Both' ? 'selected' : ''}>Co-ed</option>
                   </select>
                   <input id="att-jump-input" class="input" style="width:120px; margin:0; font-size:11px;" placeholder="Jump to last name…"
                     onkeyup="jumpToAttendanceRow(this.value)" onkeydown="if(event.key==='ArrowDown'){event.preventDefault();cycleAttendanceJump(1);} if(event.key==='ArrowUp'){event.preventDefault();cycleAttendanceJump(-1);}" />
@@ -16230,7 +16289,7 @@ const aiBody = `
                   <select class="select" onchange="boutFormBuffer.division = this.value">
                     <option value="Boys" ${boutFormBuffer.division === 'Boys' ? 'selected' : ''}>Boys</option>
                     <option value="Girls" ${boutFormBuffer.division === 'Girls' ? 'selected' : ''}>Girls</option>
-                    <option value="Both" ${boutFormBuffer.division === 'Both' ? 'selected' : ''}>Both</option>
+                    <option value="Both" ${boutFormBuffer.division === 'Both' ? 'selected' : ''}>Co-ed</option>
                   </select>
                 </div>
               </div>
@@ -16446,7 +16505,7 @@ const aiBody = `
                   <select class="select" onchange="editingBout.division = this.value">
                     <option value="Boys" ${editingBout.division === 'Boys' ? 'selected' : ''}>Boys</option>
                     <option value="Girls" ${editingBout.division === 'Girls' ? 'selected' : ''}>Girls</option>
-                    <option value="Both" ${editingBout.division === 'Both' ? 'selected' : ''}>Both</option>
+                    <option value="Both" ${editingBout.division === 'Both' ? 'selected' : ''}>Co-ed</option>
                   </select>
                 </div>
               </div>
@@ -16525,7 +16584,7 @@ const aiBody = `
                   <select class="select" style="width:auto; margin-bottom:0; font-size:11px;" onchange="expandedSheetDivision = this.value; render();">
                     <option value="Boys" ${expandedSheetDivision === 'Boys' ? 'selected' : ''}>Boys</option>
                     <option value="Girls" ${expandedSheetDivision === 'Girls' ? 'selected' : ''}>Girls</option>
-                    <option value="Both" ${expandedSheetDivision === 'Both' ? 'selected' : ''}>Boys &amp; Girls</option>
+                    <option value="Both" ${expandedSheetDivision === 'Both' ? 'selected' : ''}>Co-ed (Boys &amp; Girls)</option>
                   </select>
                   <button class="btn btn-gold" style="padding:4px 10px; font-size:10px;" onclick="printExpandedBoutSheet()">Print</button>
                   <button class="btn-back" onclick="closeModal()">Close</button>
@@ -18485,7 +18544,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
     /**
      * Creates (or reuses) on the signed-in Google account:
-     *   Strategic Wrestler/{Backups,Exports,Season Archives,AI Library,MatSide}
+     *   Strategic Wrestler/{Backups,Exports,Season Archives,AI Library,MatScorer}
      * and wires Admin folder IDs. Same names as local disk packaging.
      */
     async function ensureGoogleDriveFolderStructure() {
@@ -18566,7 +18625,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
                   appConfig.googleDriveAiLibraryFolderName = doc.name || "AI Library folder";
                 } else if (purpose === "matside") {
                   appConfig.googleDriveMatSideFolderId = doc.id;
-                  appConfig.googleDriveMatSideFolderName = doc.name || "MatSide folder";
+                  appConfig.googleDriveMatSideFolderName = doc.name || "MatScorer folder";
                 } else {
                   appConfig.googleDriveFolderId = doc.id;
                   appConfig.googleDriveFolderName = doc.name || "Backup folder";
@@ -18632,7 +18691,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
      *    Exports/
      *    Season Archives/
      *    AI Library/
-     *    MatSide/
+     *    MatScorer/
      */
     const SW_FOLDER_ROOT_NAME = "Strategic Wrestler";
     const SW_FOLDER_NAMES = Object.freeze({
@@ -18640,7 +18699,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       exports: "Exports",
       archives: "Season Archives",
       aiLibrary: "AI Library",
-      matside: "MatSide"
+      matside: "MatScorer"
     });
     const LOCAL_SW_ROOT_NAME = SW_FOLDER_ROOT_NAME;
     const LOCAL_SW_SUBFOLDERS = SW_FOLDER_NAMES;
@@ -18733,7 +18792,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         await ensureLocalSwSubfolders(root);
         toast(
           "Local folder set: …/" + (handle.name === LOCAL_SW_ROOT_NAME ? LOCAL_SW_ROOT_NAME : (handle.name + "/" + LOCAL_SW_ROOT_NAME)) +
-          "\\nSubfolders: Backups, Exports, Season Archives, AI Library, MatSide",
+          "\\nSubfolders: Backups, Exports, Season Archives, AI Library, MatScorer",
           "success",
           7000
         );
@@ -18809,7 +18868,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       const men = usesMenWomenPronouns();
       if (/^boys$/i.test(d)) return men ? "Men" : "Boys";
       if (/^girls$/i.test(d)) return men ? "Women" : "Girls";
-      if (/^both$/i.test(d)) return "Both";
+      if (/^both$/i.test(d) || /^co-?ed$/i.test(d)) return "Co-ed";
       if (/^men$/i.test(d)) return men ? "Men" : "Boys";
       if (/^women$/i.test(d)) return men ? "Women" : "Girls";
       return d;
@@ -18898,7 +18957,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         googleEmail: email || "",
         license: lic && lic.activated ? (lic.licensedEmail || "activated") : "trial/not activated",
         saveTarget: (appConfig && appConfig.downloadTarget) || "drive",
-        repo: (product === "MatSide"
+        repo: (product === "MatScorer"
           ? (typeof MATSIDE_BUG_REPORT_GITHUB_REPO !== "undefined" ? MATSIDE_BUG_REPORT_GITHUB_REPO : "CannonFodderrr/Mat-Scorer")
           : (typeof SW_BUG_REPORT_GITHUB_REPO !== "undefined" ? SW_BUG_REPORT_GITHUB_REPO : "CannonFodderrr/Strategic-Wrestler"))
       };
@@ -19011,7 +19070,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       if (purpose === "matside") {
         return {
           id: (appConfig.googleDriveMatSideFolderId || appConfig.googleDriveExportsFolderId || fallbackId).trim(),
-          name: appConfig.googleDriveMatSideFolderName || appConfig.googleDriveExportsFolderName || fallbackName || "MatSide"
+          name: appConfig.googleDriveMatSideFolderName || appConfig.googleDriveExportsFolderName || fallbackName || "MatScorer"
         };
       }
       return { id: fallbackId, name: fallbackName };
@@ -19128,8 +19187,8 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       return { target: "local-download" };
     }
 
-    /** MatSide writes per-event subfolders under the mapped MatSide root, e.g.
-     *    MatSide/Sample_Girls_Dual-21 Jan 26/*.json
+    /** MatScorer writes per-event subfolders under the mapped MatScorer root, e.g.
+     *    MatScorer/Sample_Girls_Dual-21 Jan 26/*.json
      * SW active bout may look like: 2026-01-21 [Dual] @ Sample Girls Dual
      * We score subfolder names against the active bout (date + opponent tokens).
      */
@@ -19193,7 +19252,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         score += Math.round(40 * (hits / oppTokens.length));
       }
       if (typeKey && folderKey.includes(typeKey)) score += 8;
-      // bout id exact (if MatSide ever embeds it)
+      // bout id exact (if MatScorer ever embeds it)
       if (bout.id && folderKey.includes(normalizeMatSideKey(bout.id))) score += 30;
       return score;
     }
@@ -19207,7 +19266,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       // Returns { id, name, via } where via is "event-subfolder" | "root" | "picked"
       const bout = (typeof getActiveBout === "function") ? getActiveBout() : null;
       const rootId = rootFolder && rootFolder.id;
-      const rootName = (rootFolder && rootFolder.name) || "MatSide";
+      const rootName = (rootFolder && rootFolder.name) || "MatScorer";
       if (!rootId) return null;
 
       let subs = [];
@@ -19245,7 +19304,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       // Strong auto-match
       if (bout && best && bestScore >= 40) {
         toast(
-          "MatSide event folder: " + best.name +
+          "MatScorer event folder: " + best.name +
           "\n(matched active: " + formatActiveBoutLabel(bout) + ")",
           "success",
           5000
@@ -19256,16 +19315,16 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       // Ask user: ranked subfolders
       const boutLine = bout
         ? ("Active event: " + formatActiveBoutLabel(bout) + "\n\n")
-        : "No active event selected in SW — pick a MatSide subfolder.\n\n";
+        : "No active event selected in SW — pick a MatScorer subfolder.\n\n";
       const lines = scored.map((row, i) => {
         const mark = row.score >= 40 ? " ★" : (row.score >= 20 ? " ·" : "");
         return (i + 1) + ". " + row.file.name + mark + (row.score ? " [match " + row.score + "]" : "");
       });
       const pick = prompt(
         boutLine +
-        "MatSide event folders under \"" + rootName + "\":\n\n" +
+        "MatScorer event folders under \"" + rootName + "\":\n\n" +
         lines.join("\n") +
-        "\n\nEnter number for an event folder,\nR for MatSide root (all files),\n0 to cancel:",
+        "\n\nEnter number for an event folder,\nR for MatScorer root (all files),\n0 to cancel:",
         best && bestScore > 0 ? "1" : "1"
       );
       if (pick == null) return null;
@@ -19362,7 +19421,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           pickLocalJsonFile((data) => onData(data));
           return;
         }
-        // MatSide: prefer active-event subfolder under the mapped MatSide root
+        // MatScorer: prefer active-event subfolder under the mapped MatScorer root
         let listFolderId = folder.id;
         let listFolderName = folder.name || purpose;
         if (purpose === "matside" && typeof resolveMatSideImportFolder === "function") {
@@ -19546,7 +19605,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     
     /**
      * Upload files from the local Strategic Wrestler folders to the matching Google Drive folders.
-     * Ensures Drive has the latest Backups / Exports / Archives / AI Library / MatSide files.
+     * Ensures Drive has the latest Backups / Exports / Archives / AI Library / MatScorer files.
      */
     async function syncLocalFoldersToGoogleDrive() {
       try {
@@ -19597,19 +19656,17 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           return map;
         }
 
-        async function syncDirFiles(dirHandle, folderId, prefix, driveByName) {
+        async function syncDirFiles(dirHandle, folderId, driveByName) {
           if (!dirHandle || !folderId) return;
           for await (const entry of dirHandle.values()) {
             const name = entry.name || "";
             if (entry.kind === "file") {
               try {
                 const file = await entry.getFile();
-                const driveName = prefix ? (prefix + "__" + name) : name;
                 const localMs = file.lastModified || 0;
-                const existing = driveByName[driveName];
+                const existing = driveByName[name];
                 if (existing) {
                   const driveMs = Date.parse(existing.modifiedTime || 0) || 0;
-                  // Skip if Drive is same age or newer (2s tolerance for clock/upload lag)
                   if (driveMs + 2000 >= localMs) {
                     skipped++;
                     continue;
@@ -19618,11 +19675,11 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
                   existing.modifiedTime = new Date().toISOString();
                   updated++;
                 } else {
-                  const created = await uploadBlobToGoogleDrive(folderId, driveName, file, file.type || "application/octet-stream");
+                  const created = await uploadBlobToGoogleDrive(folderId, name, file, file.type || "application/octet-stream");
                   if (created && created.id) {
-                    driveByName[driveName] = {
+                    driveByName[name] = {
                       id: created.id,
-                      name: driveName,
+                      name: name,
                       modifiedTime: new Date().toISOString()
                     };
                   }
@@ -19634,8 +19691,11 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
               }
             } else if (entry.kind === "directory") {
               try {
-                const sub = await dirHandle.getDirectoryHandle(name);
-                await syncDirFiles(sub, folderId, prefix ? (prefix + "__" + name) : name, driveByName);
+                const subLocal = await dirHandle.getDirectoryHandle(name);
+                const subDrive = await findOrCreateGoogleDriveFolder(name, folderId);
+                let subMap = {};
+                try { subMap = await listAllDriveFilesInFolder(subDrive.id); } catch (e2) { subMap = {}; }
+                await syncDirFiles(subLocal, subDrive.id, subMap);
               } catch (e) {
                 errors++;
               }
@@ -19666,7 +19726,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
             if (errNotes.length < 5) errNotes.push(subName + " list: " + (e.message || e));
             continue;
           }
-          await syncDirFiles(localDir, driveFolder.id, "", driveByName);
+          await syncDirFiles(localDir, driveFolder.id, driveByName);
         }
         toast(
           "Drive Sync finished: " + uploaded + " new, " + updated + " updated, " + skipped + " already current" +
@@ -20182,7 +20242,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           "AI Training Library: Send library to clipper (replaces Export for Kaggle for the clipper workflow)",
           "Top bar: Drive Sync uploads local Strategic Wrestler folders to matching Google Drive folders",
           "Backup retention: keep the last 5 Save files (not 5 calendar days)",
-          "Presence view-only lock for second coaches; MatSide weight-class transfer from SW export"
+          "Presence view-only lock for second coaches; MatScorer weight-class transfer from SW export"
         ]
       },
       {
@@ -20216,7 +20276,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         build: "2026-09-16-storage-presence",
         items: [
           "IndexedDB storage path with recovery snapshots",
-          "Google Drive team folder structure (Backups, Exports, Archives, AI Library, MatSide)",
+          "Google Drive team folder structure (Backups, Exports, Archives, AI Library, MatScorer)",
           "License activation via Supabase seats",
           "Storage Health panel — usage, last save, full backup export"
         ]
@@ -20225,7 +20285,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         build: "2026-09-15-core",
         items: [
           "Strategic Wrestler core: Roster, Scout, Bout Sheet, Stats, Training Plan, Calendar, Admin",
-          "MatSide package import for live-scored matches",
+          "MatScorer package import for live-scored matches",
           "Rulesets: Folkstyle, Freestyle, Greco"
         ]
       }
@@ -20234,7 +20294,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     try {
       const foot = document.createElement("div");
       foot.style.cssText = "text-align:center;font-size:10px;color:var(--muted);padding:8px;opacity:0.7;";
-      foot.textContent = "Strategic Wrestler build " + MAT_SCOUT_BUILD + " · MatSide ready";
+      foot.textContent = "Strategic Wrestler build " + MAT_SCOUT_BUILD + " · MatScorer ready";
       document.querySelector(".container")?.appendChild(foot);
     } catch (e) {}
 
