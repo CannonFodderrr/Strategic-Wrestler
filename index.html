@@ -2308,6 +2308,7 @@
       weighInTime: "",
       startTime: "",
       opponentTeam: "",
+      location: "",
       opponents: [],
       opponentsFromMemory: false
     };
@@ -5141,6 +5142,8 @@
     }
 
     function tryPrefillOpponentsFromMemory(force) {
+      // Tournaments: do not auto-load dual-meet opponent rosters
+      if (/tournament/i.test(String(boutFormBuffer.type || ""))) return false;
       const team = (boutFormBuffer.opponentTeam || "").trim();
       if (!team) return false;
       if (!force && boutFormBuffer.opponents && boutFormBuffer.opponents.length) return false;
@@ -6454,20 +6457,71 @@
     function printSeasonSchedule() {
       const season = getActiveSeason();
       const team = (branding && branding.teamName) ? branding.teamName : "Strategic Wrestler";
-      const rows = [...(season.bouts || [])].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+      const sorted = [...(season.bouts || [])].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
       const esc = s => String(s == null ? "" : s)
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+      // Group Boys + Girls duals on the same day vs the same school into one "Both" row
+      function scheduleGroupKey(b) {
+        const date = b.date || "";
+        const opp = String(b.opponentTeam || "").trim().toLowerCase();
+        const type = String(b.type || "Dual").trim().toLowerCase();
+        const ha = String(b.homeAway || "Home").trim().toLowerCase();
+        const loc = String(b.location || "").trim().toLowerCase();
+        return [date, opp, type, ha, loc].join("|");
+      }
+      const groups = [];
+      const byKey = {};
+      sorted.forEach(b => {
+        const div = String(b.division || "Boys");
+        if (div === "Boys" || div === "Girls") {
+          const key = scheduleGroupKey(b);
+          if (!byKey[key]) {
+            byKey[key] = { base: b, boys: null, girls: null };
+            groups.push(byKey[key]);
+          }
+          if (div === "Boys") byKey[key].boys = b;
+          else byKey[key].girls = b;
+        } else {
+          groups.push({ base: b, boys: null, girls: null, single: true });
+        }
+      });
+      const rows = groups.map(g => {
+        if (g.single || !(g.boys && g.girls)) {
+          return g.boys || g.girls || g.base;
+        }
+        // Merge Boys + Girls into one schedule line
+        const a = g.boys;
+        const b = g.girls;
+        return {
+          date: a.date || b.date,
+          type: a.type || b.type,
+          opponentTeam: a.opponentTeam || b.opponentTeam,
+          location: a.location || b.location || "",
+          homeAway: a.homeAway || b.homeAway || "Home",
+          division: "Both",
+          competitionLevel: a.competitionLevel === b.competitionLevel
+            ? (a.competitionLevel || "Varsity")
+            : [a.competitionLevel, b.competitionLevel].filter(Boolean).join(" / "),
+          weighInTime: a.weighInTime || b.weighInTime || "",
+          startTime: a.startTime || b.startTime || ""
+        };
+      });
+
       const bodyRows = rows.length === 0
-        ? '<tr><td colspan="8" style="text-align:center;padding:16px;">No events scheduled.</td></tr>'
+        ? '<tr><td colspan="9" style="text-align:center;padding:16px;">No events scheduled.</td></tr>'
         : rows.map(b => {
             const loc = b.homeAway === "Away" ? "@" : (b.homeAway === "Neutral" ? "vs (N)" : "vs");
+            const place = (b.location || "").trim();
+            const oppCell = place
+              ? (esc(loc) + " " + esc(b.opponentTeam) + "<br/><span style=\"font-size:10px;color:#666;\">" + esc(place) + "</span>")
+              : (esc(loc) + " " + esc(b.opponentTeam));
             return `<tr>
               <td>${esc(b.date)}</td>
               <td>${esc(b.type || "")}</td>
-              <td>${esc(loc)} ${esc(b.opponentTeam)}</td>
+              <td>${oppCell}</td>
               <td>${esc(b.homeAway || "Home")}</td>
-              <td>${esc(b.division || "")}</td>
+              <td>${esc(b.division === "Both" ? "Both" : (b.division || ""))}</td>
               <td>${esc(b.competitionLevel || "Varsity")}</td>
               <td>${esc(formatTime12(b.weighInTime))}</td>
               <td>${esc(formatTime12(b.startTime))}</td>
@@ -15544,7 +15598,8 @@ const aiBody = `
 
     function onBoutOpponentTeamChanged(value) {
       boutFormBuffer.opponentTeam = value;
-      // When the coach finishes typing a known school, prefill hidden roster if empty
+      if (/tournament/i.test(String(boutFormBuffer.type || ""))) return;
+      // Duals only: prefill opponent roster from memory when empty
       if (tryPrefillOpponentsFromMemory(false)) {
         toast(
           "Opponent roster pre-populated from memory for \"" + boutFormBuffer.opponentTeam.trim() + "\". Review names and weight classes before saving.",
@@ -16279,7 +16334,7 @@ const aiBody = `
                 </div>
                 <div>
                   <label style="font-size:11px; color:var(--muted);">Event Type</label>
-                  <select class="select" onchange="boutFormBuffer.type = this.value">
+                  <select class="select" onchange="boutFormBuffer.type = this.value; if (/tournament/i.test(this.value)) { boutFormBuffer.opponents = []; boutFormBuffer.opponentsFromMemory = false; } renderModal();">
                     <option value="Dual" ${boutFormBuffer.type === 'Dual' ? 'selected' : ''}>Dual Meet</option>
                     <option value="Tournament" ${boutFormBuffer.type === 'Tournament' ? 'selected' : ''}>Tournament</option>
                   </select>
@@ -16324,16 +16379,22 @@ const aiBody = `
                   <datalist id="opponent-team-memory-list">
                     ${Object.keys(opponentRosterMemory || {}).sort().map(k => {
                       const sample = (opponentRosterMemory[k] && opponentRosterMemory[k][0] && opponentRosterMemory[k][0].name) ? "" : "";
-                      // Reconstruct a display name from first stored bout if possible; use key title-case fallback
                       const display = k.replace(/\b\w/g, c => c.toUpperCase());
                       return `<option value="${swEsc(display)}"></option>`;
                     }).join('')}
                   </datalist>
                 </div>
               </div>
+              <div style="margin-bottom:8px;">
+                <label style="font-size:11px; color:var(--muted);">Location / Event name</label>
+                <input class="input" value="${swEsc(boutFormBuffer.location || '')}" oninput="boutFormBuffer.location = this.value" placeholder="Tournament name, tri-dual host, gym, etc. (optional)" />
+              </div>
 
               <div style="border-top:1px solid var(--panelLine); margin:12px 0; padding-top:10px;">
-                <div class="sec-label">Add Opponent Roster (Optional)${boutFormBuffer.opponentsFromMemory ? ' <span style="color:var(--gold); font-weight:600; text-transform:none; letter-spacing:0;">· pre-filled from memory — review</span>' : ''}</div>
+                <div class="sec-label" style="display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+                  <span>Add Opponent Roster (Optional)${boutFormBuffer.opponentsFromMemory ? ' <span style="color:var(--gold); font-weight:600; text-transform:none; letter-spacing:0;">· pre-filled from memory — review</span>' : ''}${/tournament/i.test(String(boutFormBuffer.type||'')) ? ' <span style="color:var(--muted); font-weight:500; text-transform:none; letter-spacing:0;">· not auto-loaded for tournaments</span>' : ''}</span>
+                  ${(boutFormBuffer.opponents && boutFormBuffer.opponents.length) ? `<button type="button" class="btn btn-red" style="padding:3px 8px; font-size:10px;" onclick="boutFormBuffer.opponents=[]; boutFormBuffer.opponentsFromMemory=false; renderModal();">Delete All</button>` : ''}
+                </div>
                 <div style="display:flex; gap:6px; margin-bottom:6px;">
                   <input id="modal-opp-name" class="input" style="flex:2; margin-bottom:0;" placeholder="Opponent Wrestler" />
                   <input id="modal-opp-weight" class="input" style="flex:1; margin-bottom:0;" placeholder="Weight" />
@@ -16356,7 +16417,7 @@ const aiBody = `
 
               <div style="display:flex; gap:8px; margin-top:12px;">
                 <button class="btn btn-green" style="flex:2;" onclick="saveNewBout()">Save Bout</button>
-                <button class="btn btn-red" style="flex:1;" onclick="closeModal()">Cancel</button>
+                <button class="btn" style="flex:1; background:var(--panelLine); color:var(--chalk);" onclick="closeModal()">Cancel</button>
               </div>
             </div>
           </div>
@@ -16539,9 +16600,16 @@ const aiBody = `
                   <input class="input" value="${swEsc(editingBout.opponentTeam)}" oninput="editingBout.opponentTeam = this.value" />
                 </div>
               </div>
+              <div style="margin-bottom:8px;">
+                <label style="font-size:11px; color:var(--muted);">Location / Event name</label>
+                <input class="input" value="${swEsc(editingBout.location || '')}" oninput="editingBout.location = this.value" placeholder="Tournament name, tri-dual host, gym, etc. (optional)" />
+              </div>
 
               <div style="border-top:1px solid var(--panelLine); margin:12px 0; padding-top:10px;">
-                <div class="sec-label">Opponent Roster</div>
+                <div class="sec-label" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>Opponent Roster</span>
+                  ${(editingBout.opponentRoster && editingBout.opponentRoster.length) ? `<button type="button" class="btn btn-red" style="padding:3px 8px; font-size:10px;" onclick="editingBout.opponentRoster=[]; renderModal();">Delete All</button>` : ''}
+                </div>
                 <div style="display:flex; gap:6px; margin-bottom:6px;">
                   <input id="modal-ed-opp-name" class="input" style="flex:2; margin-bottom:0;" placeholder="Opponent Wrestler" />
                   <input id="modal-ed-opp-weight" class="input" style="flex:1; margin-bottom:0;" placeholder="Weight" />
@@ -16557,9 +16625,10 @@ const aiBody = `
                 </div>
               </div>
 
-              <div style="display:flex; gap:8px; margin-top:12px;">
-                <button class="btn btn-green" style="flex:2;" onclick="saveEditedBout()">Save Changes</button>
-                <button class="btn btn-red" style="flex:1;" onclick="closeModal()">Cancel</button>
+              <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
+                <button class="btn btn-green" style="flex:2; min-width:120px;" onclick="saveEditedBout()">Save Changes</button>
+                <button class="btn" style="flex:1; min-width:90px; background:var(--panelLine); color:var(--chalk);" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-red" style="flex:1; min-width:90px;" onclick="deleteBoutFromEditModal()">Delete Event</button>
               </div>
             </div>
           </div>
@@ -17011,13 +17080,17 @@ const aiBody = `
       if (!boutFormBuffer.opponentTeam.trim()) return toast("Please enter the opponent team name.");
 
       const teamName = boutFormBuffer.opponentTeam.trim();
-      const rosterCopy = boutFormBuffer.opponents.map(o => ({
-        name: o.name,
-        weightClass: o.weightClass,
-        grade: o.grade || ""
-      }));
+      const isTournament = /tournament/i.test(String(boutFormBuffer.type || ""));
+      const rosterCopy = isTournament
+        ? []
+        : boutFormBuffer.opponents.map(o => ({
+            name: o.name,
+            weightClass: o.weightClass,
+            grade: o.grade || ""
+          }));
 
       const newBoutId = makeId("id");
+      const savedDivision = boutFormBuffer.division;
       season.bouts.push({
         id: newBoutId,
         date: boutFormBuffer.date,
@@ -17028,17 +17101,37 @@ const aiBody = `
         weighInTime: boutFormBuffer.weighInTime || "",
         startTime: boutFormBuffer.startTime || "",
         opponentTeam: teamName,
+        location: (boutFormBuffer.location || "").trim(),
         opponentRoster: rosterCopy,
         finalized: false
       });
 
-      // Remember opponent roster for this school for future events
+      // Remember opponent roster for duals only
       if (rosterCopy.length) saveOpponentRosterMemory(teamName, rosterCopy);
 
       store.activeBoutId = newBoutId;
-      boutFormBuffer = { date: new Date().toISOString().slice(0, 10), type: "Dual", division: "Boys", competitionLevel: "Varsity", homeAway: "Home", weighInTime: "", startTime: "", opponentTeam: "", opponents: [], opponentsFromMemory: false };
-      closeModal();
+      // Keep popup open for rapid multi-event entry (e.g. Boys then Girls same day/school).
+      // Clear opponent wrestlers only; retain date, school, location, times, type, etc.
+      boutFormBuffer.opponents = [];
+      boutFormBuffer.opponentsFromMemory = false;
+      // Flip Boys ↔ Girls to speed separate duals for the same opponent
+      if (savedDivision === "Boys") boutFormBuffer.division = "Girls";
+      else if (savedDivision === "Girls") boutFormBuffer.division = "Boys";
       persist();
+      render();
+      toast(
+        "Event created (" + savedDivision + " vs " + teamName + "). Form stays open — change division if needed, then Save again.",
+        "success",
+        5000
+      );
+    }
+
+    function deleteBoutFromEditModal() {
+      if (!editingBout || !editingBout.id) return;
+      const id = editingBout.id;
+      deleteBout(id);
+      editingBout = null;
+      activeModal = null;
       render();
     }
 
