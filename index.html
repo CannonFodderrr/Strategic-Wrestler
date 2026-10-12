@@ -6579,7 +6579,7 @@
             const place = (b.location || "").trim();
             const oppLabel = esc(b.opponentTeam || "");
             const oppCell = place
-              ? (esc(loc) + " " + oppLabel + "<br/><span style=\\"font-size:10px;color:#666;\\">" + esc(place) + "</span>")
+              ? (esc(loc) + " " + oppLabel + "<br/><span style=\"font-size:10px;color:#666;\">" + esc(place) + "</span>")
               : (esc(loc) + " " + oppLabel);
             const divLabel = (typeof divisionDisplayName === "function")
               ? divisionDisplayName(b.division === "Both" ? "Both" : (b.division || ""))
@@ -20531,7 +20531,6 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       { title: "8 · Presence & seats", body: "Only one coach edits at a time (first online). Others can view and print. Share the same license key for additional seats." },
       { title: "9 · Save often", body: "Top bar Save backs up seasons, roster, matches, events, calendar, awards, gear, Admin settings, opponent memory, AI training library, and AI training plans. Load restores a backup. Keep Drive or local folders connected." },
       { title: "You're ready", body: "Re-open this tour from Admin → Tutorial. Use ? help icons on cards. Run Diagnostics from Admin → Storage Health if something looks off." }
-    ];
     ];
 
     function startSetupTutorial() {
