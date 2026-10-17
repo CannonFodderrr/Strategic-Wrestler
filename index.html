@@ -6461,6 +6461,7 @@
 
     function printSeasonSchedule() {
       const season = getActiveSeason();
+      ensureSeasonCalendar(season);
       const team = (branding && branding.teamName) ? branding.teamName : "Strategic Wrestler";
       const sorted = [...(season.bouts || [])].sort((a, b) => {
         const d = (a.date || "").localeCompare(b.date || "");
@@ -6470,7 +6471,18 @@
       const esc = s => String(s == null ? "" : s)
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-      // 1) Merge Boys + Girls duals same day / school / type / homeAway / location → Both
+      // Label for schedule: merged Boys+Girls → "Boys/Girls" (or Men/Women); true Co-ed stays "Co-ed"
+      function scheduleDivisionLabel(div, mergedBG) {
+        if (mergedBG || div === "Boys/Girls") {
+          if (typeof usesMenWomenPronouns === "function" && usesMenWomenPronouns()) return "Men/Women";
+          return "Boys/Girls";
+        }
+        if (div === "Both" || /^co-?ed$/i.test(String(div || ""))) return "Co-ed";
+        if (typeof divisionDisplayName === "function") return divisionDisplayName(div || "");
+        return div || "";
+      }
+
+      // 1) Merge Boys + Girls duals same day / school / type / homeAway / location → Boys/Girls
       function bgKey(b) {
         return [
           b.date || "",
@@ -6497,7 +6509,11 @@
         }
       });
       const flattened = afterBg.map(g => {
-        if (g.single) return Object.assign({}, g.single);
+        if (g.single) {
+          const o = Object.assign({}, g.single);
+          o._mergedBG = false;
+          return o;
+        }
         if (g.boys && g.girls) {
           const a = g.boys, c = g.girls;
           return {
@@ -6506,7 +6522,8 @@
             opponentTeam: a.opponentTeam || c.opponentTeam,
             location: a.location || c.location || "",
             homeAway: a.homeAway || c.homeAway || "Home",
-            division: "Both",
+            division: "Boys/Girls",
+            _mergedBG: true,
             competitionLevel: a.competitionLevel === c.competitionLevel
               ? (a.competitionLevel || "Varsity")
               : [a.competitionLevel, c.competitionLevel].filter(Boolean).join(" / "),
@@ -6514,11 +6531,12 @@
             startTime: a.startTime || c.startTime || ""
           };
         }
-        return Object.assign({}, g.boys || g.girls);
+        const one = Object.assign({}, g.boys || g.girls);
+        one._mergedBG = false;
+        return one;
       });
 
       // 2) Same day + same location (non-empty): combine duals into one line
-      //    e.g. @ Big Bear w/ Eastside  (location under opponent cell)
       function locKey(b) {
         const loc = String(b.location || "").trim().toLowerCase();
         if (!loc) return null;
@@ -6529,7 +6547,7 @@
       flattened.forEach(b => {
         const k = locKey(b);
         if (!k) {
-          order.push({ multi: false, items: [b] });
+          order.push({ items: [b] });
           return;
         }
         if (!locGroups[k]) {
@@ -6538,8 +6556,8 @@
         }
         locGroups[k].items.push(b);
       });
-      const rows = order.map(g => {
-        const items = g.items || g;
+      let rows = order.map(g => {
+        const items = g.items || [];
         if (!items || items.length <= 1) return items[0];
         const place = String(items[0].location || "").trim();
         const opps = [];
@@ -6547,16 +6565,21 @@
           const o = String(b.opponentTeam || "").trim();
           if (o && !opps.some(x => x.toLowerCase() === o.toLowerCase())) opps.push(o);
         });
-        // Prefer opponent whose name matches the location as the "host"
         let primary = opps.find(o => o.toLowerCase() === place.toLowerCase()) || opps[0] || place;
         const rest = opps.filter(o => o.toLowerCase() !== primary.toLowerCase());
         const haVotes = { Home: 0, Away: 0, Neutral: 0 };
         items.forEach(b => { haVotes[b.homeAway || "Home"] = (haVotes[b.homeAway || "Home"] || 0) + 1; });
-        let homeAway = "Away";
-        let best = -1;
+        let homeAway = "Away", best = -1;
         Object.keys(haVotes).forEach(k => { if (haVotes[k] > best) { best = haVotes[k]; homeAway = k; } });
         const divs = Array.from(new Set(items.map(b => b.division || "Boys")));
-        let division = divs.length === 1 ? divs[0] : "Both";
+        const anyMerged = items.some(b => b._mergedBG);
+        const anyCoed = items.some(b => b.division === "Both");
+        let division = divs.length === 1 ? divs[0] : "Boys/Girls";
+        let _mergedBG = anyMerged || (divs.includes("Boys") && divs.includes("Girls"));
+        if (anyCoed && !anyMerged && divs.every(d => d === "Both")) {
+          division = "Both";
+          _mergedBG = false;
+        }
         const levels = Array.from(new Set(items.map(b => b.competitionLevel || "Varsity")));
         return {
           date: items[0].date,
@@ -6565,6 +6588,7 @@
           location: place,
           homeAway,
           division,
+          _mergedBG,
           competitionLevel: levels.length === 1 ? levels[0] : levels.join(" / "),
           weighInTime: items.map(b => b.weighInTime).filter(Boolean)[0] || "",
           startTime: items.map(b => b.startTime).filter(Boolean)[0] || "",
@@ -6572,20 +6596,118 @@
         };
       });
 
+      // 3+4) Holidays + custom entries: same-day items become one line
+      //     e.g. "Christmas Day, No Practice". Consecutive days with the same
+      //     combined label still merge into a date range.
+      const dayExtras = {}; // date -> { parts: string[] }
+      function addExtraPart(date, part) {
+        if (!date || !part) return;
+        const p = String(part).trim();
+        if (!p) return;
+        if (!dayExtras[date]) dayExtras[date] = { parts: [] };
+        if (!dayExtras[date].parts.some(x => x.toLowerCase() === p.toLowerCase())) {
+          dayExtras[date].parts.push(p);
+        }
+      }
+
+      const includeHolidays = (appConfig && appConfig.printScheduleHolidays !== false);
+      if (includeHolidays && typeof getUsHolidaysForYear === "function") {
+        const years = new Set();
+        (season.bouts || []).forEach(b => { if (b.date && b.date.length >= 4) years.add(Number(b.date.slice(0, 4))); });
+        (season.calendarMonths || []).forEach(m => { if (m && m.length >= 4) years.add(Number(m.slice(0, 4))); });
+        (season.calendarEntries || []).forEach(e => { if (e && e.date && e.date.length >= 4) years.add(Number(e.date.slice(0, 4))); });
+        if (!years.size) years.add(new Date().getFullYear());
+        years.forEach(y => {
+          if (!y) return;
+          const hol = getUsHolidaysForYear(y) || {};
+          Object.keys(hol).forEach(md => {
+            addExtraPart(y + "-" + md, hol[md]);
+          });
+        });
+      }
+
+      (season.calendarEntries || []).forEach(e => {
+        if (!e || e.includeOnSchedule === false) return;
+        addExtraPart(e.date, e.title || "Custom");
+      });
+
+      // Build combined labels per day, then merge consecutive days with identical label
+      const byLabel = {}; // lower label -> { title, dates[] }
+      Object.keys(dayExtras).sort().forEach(date => {
+        const title = dayExtras[date].parts.join(", ");
+        const key = title.toLowerCase();
+        if (!byLabel[key]) byLabel[key] = { title, dates: [] };
+        byLabel[key].dates.push(date);
+      });
+
+      Object.keys(byLabel).forEach(key => {
+        const group = byLabel[key];
+        group.dates.sort();
+        let runStart = null, runPrev = null;
+        const flush = () => {
+          if (!runStart) return;
+          const dateLabel = runStart === runPrev ? runStart : (runStart + " – " + runPrev);
+          rows.push({
+            date: runStart,
+            dateLabel,
+            type: "Calendar",
+            opponentTeam: group.title,
+            location: "",
+            homeAway: "—",
+            division: "—",
+            _mergedBG: false,
+            competitionLevel: "—",
+            weighInTime: "",
+            startTime: "",
+            _calendarExtra: true
+          });
+          runStart = runPrev = null;
+        };
+        group.dates.forEach(d => {
+          if (!runStart) { runStart = d; runPrev = d; return; }
+          const prev = new Date(runPrev + "T12:00:00");
+          const cur = new Date(d + "T12:00:00");
+          const diff = Math.round((cur - prev) / 86400000);
+          if (diff === 1) { runPrev = d; }
+          else { flush(); runStart = d; runPrev = d; }
+        });
+        flush();
+      });
+
+      rows.sort((a, b) => {
+        const d = String(a.date || "").localeCompare(String(b.date || ""));
+        if (d) return d;
+        const ta = a._calendarExtra ? 1 : 0;
+        const tb = b._calendarExtra ? 1 : 0;
+        if (ta !== tb) return ta - tb;
+        return String(a.opponentTeam || "").localeCompare(String(b.opponentTeam || ""));
+      });
+
       const bodyRows = rows.length === 0
         ? '<tr><td colspan="8" style="text-align:center;padding:16px;">No events scheduled.</td></tr>'
         : rows.map(b => {
+            const dateCell = esc(b.dateLabel || b.date || "");
+            if (b._calendarExtra) {
+              return `<tr>
+              <td>${dateCell}</td>
+              <td>${esc(b.type || "")}</td>
+              <td>${esc(b.opponentTeam || "")}</td>
+              <td>${esc(b.homeAway || "—")}</td>
+              <td>${esc(b.division || "—")}</td>
+              <td>${esc(b.competitionLevel || "—")}</td>
+              <td>—</td>
+              <td>—</td>
+            </tr>`;
+            }
             const loc = b.homeAway === "Away" ? "@" : (b.homeAway === "Neutral" ? "vs (N)" : "vs");
             const place = (b.location || "").trim();
             const oppLabel = esc(b.opponentTeam || "");
             const oppCell = place
-              ? (esc(loc) + " " + oppLabel + "<br/><span style=\"font-size:10px;color:#666;\">" + esc(place) + "</span>")
+              ? (esc(loc) + " " + oppLabel + '<br/><span style="font-size:10px;color:#666;">' + esc(place) + "</span>")
               : (esc(loc) + " " + oppLabel);
-            const divLabel = (typeof divisionDisplayName === "function")
-              ? divisionDisplayName(b.division === "Both" ? "Both" : (b.division || ""))
-              : (b.division === "Both" ? "Both" : (b.division || ""));
+            const divLabel = scheduleDivisionLabel(b.division, b._mergedBG);
             return `<tr>
-              <td>${esc(b.date)}</td>
+              <td>${dateCell}</td>
               <td>${esc(b.type || "")}</td>
               <td>${oppCell}</td>
               <td>${esc(b.homeAway || "Home")}</td>
@@ -6611,13 +6733,13 @@
 </style></head><body>
   <h1>${esc(team)}</h1>
   <h2>${esc(season.name)} — Season Schedule</h2>
-  <div class="meta">Printed ${new Date().toLocaleDateString()} · ${rows.length} event(s)</div>
+  <div class="meta">Printed ${new Date().toLocaleDateString()} · ${rows.length} line(s)</div>
   <table>
     <thead>
       <tr>
         <th>Date</th>
         <th>Type</th>
-        <th>Opponent</th>
+        <th>Opponent / Entry</th>
         <th>Home/Away</th>
         <th>Division</th>
         <th>Level</th>
@@ -13968,14 +14090,25 @@ function computeRawStatsBundle(wrestlerId) {
       ensureSeasonCalendar(season);
       const entry = (season.calendarEntries || []).find(e => e.id === entryId);
       if (!entry) return;
-      const next = prompt("Edit custom entry title (leave blank and OK to delete):", entry.title || "");
-      if (next === null) return;
-      if (!String(next).trim()) {
-        if (!confirm("Delete this custom entry?")) return;
-        season.calendarEntries = season.calendarEntries.filter(e => e.id !== entryId);
-      } else {
-        entry.title = String(next).trim();
-      }
+      calendarCustomEntryDraft = {
+        id: entry.id,
+        date: entry.date,
+        title: entry.title || "",
+        includeOnSchedule: entry.includeOnSchedule !== false
+      };
+      activeModal = "calendar-custom-entry";
+      renderModal();
+    }
+
+    function deleteCalendarCustomEntryFromModal() {
+      if (!calendarCustomEntryDraft || !calendarCustomEntryDraft.id) return;
+      if (!confirm("Delete this custom entry?")) return;
+      const season = getActiveSeason();
+      ensureSeasonCalendar(season);
+      season.calendarEntries = (season.calendarEntries || []).filter(e => e.id !== calendarCustomEntryDraft.id);
+      calendarCustomEntryDraft = null;
+      closeModal();
+      if (calendarSelectedDate) activeModal = "calendar-day";
       persist();
       render();
     }
@@ -14105,19 +14238,50 @@ function computeRawStatsBundle(wrestlerId) {
     }
 
     function addCalendarCustomEntry(dateStr) {
-      const title = prompt("Custom calendar entry title:", "Practice");
-      if (title == null) return;
+      calendarCustomEntryDraft = {
+        id: null,
+        date: dateStr,
+        title: "Practice",
+        includeOnSchedule: true
+      };
+      activeModal = "calendar-custom-entry";
+      renderModal();
+    }
+
+    function saveCalendarCustomEntryFromModal() {
+      const titleEl = document.getElementById("cal-custom-title");
+      const chk = document.getElementById("cal-custom-on-schedule");
+      const title = titleEl ? titleEl.value.trim() : "";
+      if (!title) return toast("Enter a title for the custom entry.");
+      const includeOnSchedule = chk ? !!chk.checked : true;
       const season = getActiveSeason();
       ensureSeasonCalendar(season);
-      season.calendarEntries.push({
-        id: makeId("id"),
-        date: dateStr,
-        type: "custom",
-        title: title.trim() || "Practice"
-      });
+      if (calendarCustomEntryDraft && calendarCustomEntryDraft.id) {
+        const entry = (season.calendarEntries || []).find(e => e.id === calendarCustomEntryDraft.id);
+        if (entry) {
+          entry.title = title;
+          entry.includeOnSchedule = includeOnSchedule;
+        }
+      } else {
+        const dateStr = (calendarCustomEntryDraft && calendarCustomEntryDraft.date) || calendarSelectedDate;
+        season.calendarEntries.push({
+          id: makeId("id"),
+          date: dateStr,
+          type: "custom",
+          title,
+          includeOnSchedule
+        });
+      }
+      calendarCustomEntryDraft = null;
+      closeModal();
+      if (calendarSelectedDate) {
+        activeModal = "calendar-day";
+      }
       persist();
       render();
     }
+
+    let calendarCustomEntryDraft = null;
 
     function openCalendarDayModal(dateStr) {
       calendarSelectedDate = dateStr;
@@ -14209,7 +14373,25 @@ function computeRawStatsBundle(wrestlerId) {
               <input type="month" id="cal-add-month" class="input" style="display:none; width:auto; margin:0 0 0 4px; font-size:12px;"
                 onchange="addCalendarMonth(this.value); this.style.display='none';" />
             </span>
-            <button class="btn btn-gold" style="font-size:11px;" onclick="printCalendarMonth()" ${!ym ? 'disabled' : ''}>🖨 Print Month</button>
+            <label style="display:inline-flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk); cursor:pointer; margin:0;">
+              <input type="checkbox" ${(appConfig.printScheduleHolidays !== false) ? "checked" : ""} onchange="appConfig.printScheduleHolidays = this.checked; persist();" />
+              Holidays on printed schedule
+            </label>
+            <select class="select" style="width:auto; margin:0; font-size:11px;" onchange="boutDivisionFilter = this.value; render();">
+              <option value="All" ${boutDivisionFilter === 'All' ? 'selected' : ''}>All Divisions</option>
+              <option value="Boys" ${boutDivisionFilter === 'Boys' ? 'selected' : ''}>${swEsc((typeof divisionDisplayName === 'function' ? divisionDisplayName('Boys') : 'Boys') + ' Only')}</option>
+              <option value="Girls" ${boutDivisionFilter === 'Girls' ? 'selected' : ''}>${swEsc((typeof divisionDisplayName === 'function' ? divisionDisplayName('Girls') : 'Girls') + ' Only')}</option>
+              <option value="Hide" ${boutDivisionFilter === 'Hide' ? 'selected' : ''}>Hide Events</option>
+            </select>
+            <select class="select" style="width:auto; margin:0; font-size:11px;" onchange="boutLevelFilter = this.value; render();">
+              ${typeof boutLevelFilterHtml === 'function' ? boutLevelFilterHtml() : ''}
+            </select>
+            <button class="btn btn-gold" style="padding:4px 10px; font-size:10px;" onclick="printSeasonSchedule()">Print Schedule</button>
+            <select id="cal-print-scope" class="select" style="width:auto; margin:0; font-size:11px;">
+              <option value="selected">Selected month</option>
+              <option value="all">All calendar months</option>
+            </select>
+            <button class="btn btn-gold" style="font-size:11px;" onclick="printCalendarMonth()" ${!ym && !(months && months.length) ? 'disabled' : ''}>🖨 Print Calendar</button>
           </div>
           ${!ym ? `<p style="color:var(--muted); font-size:12px;">Add a month tab to begin. Click any day to take attendance or create an event.</p>` : `
             <div style="font-size:14px; font-weight:800; color:var(--gold); margin-bottom:4px;">${swEsc(monthNames[month-1])} ${swEsc(year)}</div>
@@ -14223,50 +14405,69 @@ function computeRawStatsBundle(wrestlerId) {
       const season = getActiveSeason();
       ensureSeasonCalendar(season);
       const months = season.calendarMonths || [];
-      const ym = calendarActiveMonth || months[0];
-      if (!ym) return toast("Add a month tab first.");
-      const parts = ym.split("-").map(Number);
-      const year = parts[0], month = parts[1];
-      const monthNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-      const team = branding.teamName || "Team";
-      const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const scopeEl = document.getElementById("cal-print-scope");
+      const scope = scopeEl ? scopeEl.value : "selected";
+      let list = [];
+      if (scope === "all") {
+        list = months.slice().sort();
+      } else {
+        const ym = calendarActiveMonth || months[0];
+        if (ym) list = [ym];
+      }
+      if (!list.length) return toast("Add a month tab first.");
 
-      const first = new Date(year, month - 1, 1);
-      const startPad = first.getDay();
-      const daysInMonth = new Date(year, month, 0).getDate();
-      const cells = [];
-      for (let i = 0; i < startPad; i++) cells.push(`<td></td>`);
-      for (let d = 1; d <= daysInMonth; d++) {
-        const dateStr = year + "-" + String(month).padStart(2,"0") + "-" + String(d).padStart(2,"0");
-        const bouts = (season.bouts || []).filter(b => b.date === dateStr);
-        const customs = (season.calendarEntries || []).filter(e => e.date === dateStr);
-        const sum = summarizeDayAttendance(dateStr);
-        cells.push(`<td style="vertical-align:top; height:80px;">
-          <div style="font-weight:800;">${swEsc(d)}</div>
-          ${sum.hasAtt ? `<div style="font-size:9px; color:#666;">${esc(sum.label)}</div>` : ""}
-          ${bouts.map(b => `<div style="font-size:9px; color:${b.division === 'Boys' ? '#2A5FA5' : (b.division === 'Girls' ? '#B23A6B' : '#2F7A4F')};">${esc(b.type)}: ${esc(b.opponentTeam || "")}</div>`).join("")}
-          ${customs.map(c => `<div style="font-size:9px;">${esc(c.title)}</div>`).join("")}
-        </td>`);
-        if ((startPad + d) % 7 === 0 && d !== daysInMonth) cells.push(`</tr><tr>`);
+      const monthNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+      const team = (branding && branding.teamName) || "Team";
+      const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const includeHolidays = (appConfig && appConfig.printScheduleHolidays !== false);
+
+      function monthTableHtml(ym) {
+        const parts = ym.split("-").map(Number);
+        const year = parts[0], month = parts[1];
+        const holidays = (includeHolidays && typeof getUsHolidaysForYear === "function")
+          ? (getUsHolidaysForYear(year) || {}) : {};
+        const first = new Date(year, month - 1, 1);
+        const startPad = first.getDay();
+        const daysInMonth = new Date(year, month, 0).getDate();
+        const cells = [];
+        for (let i = 0; i < startPad; i++) cells.push(`<td></td>`);
+        for (let d = 1; d <= daysInMonth; d++) {
+          const dateStr = year + "-" + String(month).padStart(2,"0") + "-" + String(d).padStart(2,"0");
+          const md = String(month).padStart(2,"0") + "-" + String(d).padStart(2,"0");
+          const hol = holidays[md] || "";
+          const bouts = (season.bouts || []).filter(b => b.date === dateStr);
+          const customs = (season.calendarEntries || []).filter(e => e.date === dateStr);
+          const sum = summarizeDayAttendance(dateStr);
+          cells.push(`<td style="vertical-align:top; height:80px;">
+            <div style="font-weight:800;">${d}</div>
+            ${hol ? `<div style="font-size:9px; color:#8a5a00;">${esc(hol)}</div>` : ""}
+            ${sum.hasAtt ? `<div style="font-size:9px; color:#666;">${esc(sum.label)}</div>` : ""}
+            ${bouts.map(b => `<div style="font-size:9px; color:${b.division === 'Boys' ? '#2A5FA5' : (b.division === 'Girls' ? '#B23A6B' : '#2F7A4F')};">${esc(b.type)}: ${esc(b.opponentTeam || "")}</div>`).join("")}
+            ${customs.map(c => `<div style="font-size:9px;">${esc(c.title)}${c.includeOnSchedule === false ? " *" : ""}</div>`).join("")}
+          </td>`);
+          if ((startPad + d) % 7 === 0 && d !== daysInMonth) cells.push(`</tr><tr>`);
+        }
+        return `
+          <h2 style="page-break-before:${list.indexOf(ym) > 0 ? 'always' : 'auto'};">${esc(monthNames[month-1])} ${year} — Team Calendar</h2>
+          <table>
+            <thead><tr>${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d => `<th>${d}</th>`).join("")}</tr></thead>
+            <tbody><tr>${cells.join("")}</tr></tbody>
+          </table>`;
       }
 
       const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"/><title>${esc(team)} — ${esc(monthNames[month-1])} ${swEsc(year)}</title>
+<html><head><meta charset="utf-8"/><title>${esc(team)} — Calendar</title>
 <style>
   body { font-family: system-ui, -apple-system, sans-serif; color: #111; margin: 24px; }
   h1 { font-size: 20px; margin: 0 0 4px 0; }
-  h2 { font-size: 14px; font-weight: 600; color: #444; margin: 0 0 16px 0; }
-  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  h2 { font-size: 14px; font-weight: 600; color: #444; margin: 16px 0 12px 0; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-bottom: 18px; }
   th, td { border: 1px solid #ccc; padding: 4px; font-size: 11px; }
   th { background: #f3f4f6; text-transform: uppercase; font-size: 10px; }
   @media print { body { margin: 12px; } }
 </style></head><body>
   <h1>${esc(team)}</h1>
-  <h2>${esc(monthNames[month-1])} ${swEsc(year)} — Team Calendar</h2>
-  <table>
-    <thead><tr>${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d => `<th>${swEsc(d)}</th>`).join("")}</tr></thead>
-    <tbody><tr>${cells.join("")}</tr></tbody>
-  </table>
+  ${list.map(monthTableHtml).join("")}
   <script>window.onload = function(){ window.print(); };<\/script>
 </body></html>`;
 
@@ -16256,6 +16457,30 @@ const aiBody = `
               <div style="display:flex; gap:8px; margin-top:12px;">
                 <button class="btn btn-green" style="flex:2;" onclick="saveNewSeason()">Create Season</button>
                 <button class="btn btn-red" style="flex:1;" onclick="closeModal()">Cancel</button>
+              </div>
+            </div>
+          </div>
+        `;
+        return;
+      }
+
+      if (activeModal === "calendar-custom-entry" && calendarCustomEntryDraft) {
+        const draft = calendarCustomEntryDraft;
+        const isEdit = !!draft.id;
+        root.innerHTML = `
+          <div class="modal-overlay" onclick="closeModal()">
+            <div class="modal-box" style="max-width:420px;" onclick="event.stopPropagation()">
+              <div class="card-title">${isEdit ? "Edit custom entry" : "Custom calendar entry"}</div>
+              <label style="font-size:11px; color:var(--muted);">Title</label>
+              <input id="cal-custom-title" class="input" value="${swEsc(draft.title || '')}" placeholder="e.g. No practice, Team dinner" />
+              <label style="display:flex; align-items:flex-start; gap:8px; margin:12px 0; cursor:pointer; font-size:12px; color:var(--chalk);">
+                <input type="checkbox" id="cal-custom-on-schedule" ${draft.includeOnSchedule !== false ? "checked" : ""} style="margin-top:2px;" />
+                <span>Include on printed schedule <span style="color:var(--muted); font-size:11px;">(default on)</span></span>
+              </label>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button class="btn btn-green" style="flex:2;" onclick="saveCalendarCustomEntryFromModal()">Save</button>
+                <button class="btn" style="flex:1; background:var(--panelLine); color:var(--chalk);" onclick="calendarCustomEntryDraft=null; closeModal(); if (calendarSelectedDate) { activeModal='calendar-day'; renderModal(); }">Cancel</button>
+                ${isEdit ? `<button class="btn btn-red" style="flex:1;" onclick="deleteCalendarCustomEntryFromModal()">Delete</button>` : ""}
               </div>
             </div>
           </div>
