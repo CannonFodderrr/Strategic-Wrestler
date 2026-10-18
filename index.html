@@ -3881,11 +3881,31 @@
           activated: false,
           activationKey: "",
           activatedAt: null,
-          customerNote: ""
+          customerNote: "",
+          trialDeviceId: null,
+          trialSyncedAt: null,
+          trialSource: "local"
         };
         saveLicenseState(s);
       }
+      if (!s.trialDeviceId) {
+        s.trialDeviceId = getTrialDeviceId();
+        saveLicenseState(s);
+      }
       return s;
+    }
+
+    function getTrialDeviceId() {
+      try {
+        let id = localStorage.getItem("sw-trial-device-id");
+        if (!id) {
+          id = "trial_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+          localStorage.setItem("sw-trial-device-id", id);
+        }
+        return id;
+      } catch (e) {
+        return "trial_session_" + Date.now();
+      }
     }
 
     function licenseTrialEndsAt(state) {
@@ -3925,6 +3945,164 @@
       state = state || ensureLicenseState();
       if (isLicenseActivated(state)) return false;
       return Date.now() <= licenseTrialEndsAt(state);
+    }
+
+    /**
+     * Sync 90-day trial with Supabase so clearing browser data cannot reset the clock
+     * when the same Google account or device fingerprint is seen again.
+     *
+     * Requires table `trials` (run SQL in Supabase once — see Admin License help).
+     * Uses earliest trial_started_at across device_id and google_email matches.
+     */
+    async function syncTrialWithSupabase() {
+      if (!supabaseConfigured()) return { ok: false, reason: "not_configured" };
+      const state = ensureLicenseState();
+      if (state.activated && state.licenseSource === "supabase") {
+        return { ok: true, reason: "activated" };
+      }
+      const deviceId = state.trialDeviceId || getTrialDeviceId();
+      const email = String(
+        (typeof googleUserEmail === "string" && googleUserEmail) ||
+        state.licensedEmail ||
+        state.trialEmail ||
+        ""
+      ).trim().toLowerCase();
+      const nowIso = new Date().toISOString();
+      let localStart = Number(state.trialStartedAt) || Date.now();
+      let candidates = [];
+
+      try {
+        // Lookup by device
+        try {
+          const byDev = await supabaseRest(
+            "trials?device_id=eq." + encodeURIComponent(deviceId) +
+            "&select=id,device_id,google_email,trial_started_at&limit=5",
+            { method: "GET" }
+          );
+          if (Array.isArray(byDev)) candidates = candidates.concat(byDev);
+        } catch (e) {
+          // Table missing or RLS — keep local trial
+          console.warn("trial lookup device", e);
+          return { ok: false, reason: "table_or_rls", error: String(e && e.message ? e.message : e) };
+        }
+        if (email) {
+          try {
+            const byEmail = await supabaseRest(
+              "trials?google_email=eq." + encodeURIComponent(email) +
+              "&select=id,device_id,google_email,trial_started_at&limit=5",
+              { method: "GET" }
+            );
+            if (Array.isArray(byEmail)) candidates = candidates.concat(byEmail);
+          } catch (e) {
+            console.warn("trial lookup email", e);
+          }
+        }
+
+        let earliest = localStart;
+        let primary = null;
+        candidates.forEach(function (row) {
+          if (!row || !row.trial_started_at) return;
+          const t = Date.parse(row.trial_started_at);
+          if (!isNaN(t) && t < earliest) {
+            earliest = t;
+            primary = row;
+          } else if (!isNaN(t) && !primary) {
+            primary = row;
+          }
+        });
+
+        // Server has an older start → adopt it (prevents reset-by-clear)
+        if (earliest < localStart) {
+          state.trialStartedAt = earliest;
+          state.trialSource = "supabase";
+          state.trialSyncedAt = Date.now();
+          if (email) state.trialEmail = email;
+          saveLicenseState(state);
+        }
+
+        const startIso = new Date(state.trialStartedAt || localStart).toISOString();
+
+        if (primary && primary.id) {
+          // Patch last_seen + ensure email/device linked; never move trial_started_at later
+          const patch = { last_seen_at: nowIso, device_id: deviceId };
+          if (email) patch.google_email = email;
+          // If server row is newer than local (shouldn't for start), keep server start
+          try {
+            await supabaseRest("trials?id=eq." + encodeURIComponent(primary.id), {
+              method: "PATCH",
+              prefer: "return=minimal",
+              body: patch
+            });
+          } catch (e) {
+            console.warn("trial patch", e);
+          }
+          // If we have email and a device-only row, also ensure email row exists
+          if (email) {
+            const emailRows = candidates.filter(function (r) {
+              return r && String(r.google_email || "").toLowerCase() === email;
+            });
+            if (!emailRows.length) {
+              try {
+                await supabaseRest("trials", {
+                  method: "POST",
+                  prefer: "return=minimal",
+                  body: {
+                    device_id: deviceId + "_email",
+                    google_email: email,
+                    trial_started_at: startIso,
+                    last_seen_at: nowIso
+                  }
+                });
+              } catch (e) {
+                // unique conflict ok
+              }
+            }
+          }
+        } else {
+          // First registration for this device/email
+          try {
+            await supabaseRest("trials", {
+              method: "POST",
+              prefer: "return=minimal",
+              body: {
+                device_id: deviceId,
+                google_email: email || null,
+                trial_started_at: startIso,
+                last_seen_at: nowIso
+              }
+            });
+            state.trialSource = "supabase";
+            state.trialSyncedAt = Date.now();
+            if (email) state.trialEmail = email;
+            saveLicenseState(state);
+          } catch (e) {
+            // Race: row appeared — re-fetch
+            console.warn("trial insert", e);
+            try {
+              const again = await supabaseRest(
+                "trials?device_id=eq." + encodeURIComponent(deviceId) +
+                "&select=id,trial_started_at&limit=1",
+                { method: "GET" }
+              );
+              if (Array.isArray(again) && again[0] && again[0].trial_started_at) {
+                const t = Date.parse(again[0].trial_started_at);
+                if (!isNaN(t)) {
+                  state.trialStartedAt = Math.min(state.trialStartedAt || t, t);
+                  state.trialSource = "supabase";
+                  state.trialSyncedAt = Date.now();
+                  saveLicenseState(state);
+                }
+              }
+            } catch (e2) {}
+          }
+        }
+
+        try { if (typeof updateLicenseBadge === "function") updateLicenseBadge(); } catch (e) {}
+        return { ok: true, trialStartedAt: state.trialStartedAt, source: state.trialSource };
+      } catch (e) {
+        console.warn("syncTrialWithSupabase", e);
+        return { ok: false, reason: "error", error: String(e && e.message ? e.message : e) };
+      }
     }
 
     function isLicenseValid(state) {
@@ -4251,12 +4429,14 @@
       try {
         if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly()) return;
 
-        // Do not overwrite non-empty local data on quiet boot unless backup is clearly newer
+        // Quiet boot: do not overwrite non-empty local data. User-confirmed / force loads may.
         try {
+          const force = arguments.length > 1 ? !!arguments[1] : false;
+          // reinterpret: autoLoadMostRecentBackup(silent, force)
+          window.__swAutoLoadForce = force;
           const season = typeof getActiveSeason === "function" ? getActiveSeason() : null;
           const hasLocal = season && ((season.roster || []).length > 0 || (season.matches || []).length > 0);
-          if (silent && hasLocal) {
-            // Still allow editor-seat takeover loads (silent === false)
+          if (silent && hasLocal && !force) {
             return;
           }
         } catch (e) {}
@@ -4454,22 +4634,70 @@
           try { updateIoLocationBadges(); } catch (e) {}
           return;
         }
-        // prompt "" = silent if browser already has a Google session for this client
+        // Silent only — browsers block OAuth popups without a user click
         requestGoogleAccessToken("").then(function () {
           try { updateIoLocationBadges(); } catch (e) {}
-          try {
-            if (typeof ensureGoogleDriveFolderStructure === "function" && !(appConfig.googleDriveFolderId || "").trim()) {
-              // Do not auto-create folders without consent; badge stays ready for Save
-            }
-          } catch (e2) {}
         }).catch(function () {
-          // First visit or blocked popup — user can Connect from Admin / G badge
           try { updateIoLocationBadges(); } catch (e3) {}
         });
       } catch (e) {}
     }
+
+    /** In-app prompt (not a browser popup) — user click starts OAuth so it is not blocked. */
+    function offerGoogleDriveConnectOnStartup() {
+      try {
+        if (!googleClientId()) return;
+        if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
+          // Already connected this session — still offer load once
+          offerLoadLatestBackupPrompt();
+          return;
+        }
+        if (sessionStorage.getItem("sw-gdrive-connect-prompted") === "1") return;
+        sessionStorage.setItem("sw-gdrive-connect-prompted", "1");
+        activeModal = "gdrive-connect-prompt";
+        try { renderModal(); } catch (e) { render(); }
+      } catch (e) {}
+    }
+
+    function offerLoadLatestBackupPrompt() {
+      try {
+        if (sessionStorage.getItem("sw-load-latest-prompted") === "1") return;
+        sessionStorage.setItem("sw-load-latest-prompted", "1");
+        activeModal = "load-latest-backup-prompt";
+        try { renderModal(); } catch (e) { render(); }
+      } catch (e) {}
+    }
+
+    async function connectGoogleDriveThenOfferLoad() {
+      try {
+        if (typeof authGoogleDrive === "function") {
+          await authGoogleDrive();
+        } else if (typeof requestGoogleAccessToken === "function") {
+          await requestGoogleAccessToken("consent");
+        }
+      } catch (e) {
+        try { toast("Google Drive connect cancelled or failed.", "info", 4000); } catch (e2) {}
+      }
+      try { updateIoLocationBadges(); } catch (e) {}
+      try { await syncTrialWithSupabase(); } catch (e) {}
+      offerLoadLatestBackupPrompt();
+    }
+
     try {
-      setTimeout(function () { tryAutoConnectGoogleDrive(); }, 1800);
+      setTimeout(function () {
+        try { syncTrialWithSupabase().then(function () { try { if (typeof updateLicenseBadge === "function") updateLicenseBadge(); } catch (e) {} }).catch(function () {}); } catch (e) {}
+        try { tryAutoConnectGoogleDrive(); } catch (e) {}
+        // If still not signed in after silent attempt, show in-app connect card
+        setTimeout(function () {
+          try {
+            if (typeof isGoogleSignedIn === "function" && !isGoogleSignedIn()) {
+              offerGoogleDriveConnectOnStartup();
+            } else {
+              try { syncTrialWithSupabase(); } catch (e2) {}
+            }
+          } catch (e) {}
+        }, 1200);
+      }, 1800);
     } catch (e) {}
 
     /**
@@ -5449,15 +5677,31 @@
 
     if (typeof window !== "undefined" && !window.__matScoutUnloadBound) {
       window.__matScoutUnloadBound = true;
+      function saveOnCloseIfEditor() {
+        try {
+          if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly()) return;
+          // Always flush browser storage; attempt full backup to Drive/local when editor
+          try { if (typeof flushStorageNow === "function") flushStorageNow(); } catch (e) {}
+          try {
+            if (typeof saveSharedSeasonData === "function") {
+              // Fire-and-forget; browsers may cancel long async work on unload
+              const p = saveSharedSeasonData();
+              if (p && typeof p.catch === "function") p.catch(function () {});
+            }
+          } catch (e) {}
+        } catch (e) {}
+      }
       window.addEventListener("beforeunload", () => {
         if (videoBlobUrl) {
           try { URL.revokeObjectURL(videoBlobUrl); } catch (e) {}
           videoBlobUrl = null;
         }
+        try { saveOnCloseIfEditor(); } catch (e) {}
         try { if (typeof signOffPresence === "function") signOffPresence(); } catch (e) {}
         try { if (typeof stopPresenceSystem === "function") stopPresenceSystem(); } catch (e) {}
       });
       window.addEventListener("pagehide", () => {
+        try { saveOnCloseIfEditor(); } catch (e) {}
         try { if (typeof signOffPresence === "function") signOffPresence(); } catch (e) {}
       });
     }
@@ -5740,6 +5984,7 @@
       if (currentTab === "plan") renderPlan(container);
       if (currentTab === "calendar") renderCalendar(container);
       if (currentTab === "admin") renderAdmin(container);
+      try { setTimeout(function(){ softCheckClipServer(); }, 200); } catch (e) {}
 
       if (uiUnlocked && container && currentTab !== "admin") {
         const banner = document.createElement("div");
@@ -5880,7 +6125,7 @@
       "roster_edit_athlete": "Set weight class, minimum weight, grade, and competition level, plus contact info for the athlete and up to two parents or guardians. Status flags mark an athlete as injured (INJ), suspended (SUSP), quit (QUIT), or redshirt (RS) \u2014 flagged athletes stay on the roster and keep their history but are visually separated in lists and print-outs. Archiving removes an athlete from active views without deleting any of their match data.",
       "scout_log": "Every scored action in order, with a timestamp in tenths of a second. Click an entry to edit the move, direction, or modifiers if you mis-tagged something live. Undo steps back one action at a time, newest first. Timestamps are what drive AI clip extraction later, so nudging one to the exact moment of the shot pays off if you plan to use video analysis.",
       "scout_video": "Load footage three ways: upload a local video file, paste a YouTube URL, or import a scored match from the MatScorer phone app as JSON and attach the recording to it. With video loaded, every event you tag gets stamped against the playhead, which is what makes clip review and AI training possible.",
-      "license_trial": "The app runs on a 90-day trial from first launch in each browser. After that, scoring, committing matches, and adding athletes are locked until you enter an activation key. Keys are verified offline, so no internet connection is needed to activate.",
+      "license_trial": "The app runs on a 90-day trial from first launch. When online, the trial start is stored in Supabase (device id + Google email when connected) so clearing browser data cannot reset the clock for the same account. After expiry, scoring and roster edits lock until you enter a paid activation key verified via Supabase.",
       "calendar_day": "Take attendance, schedule an event, or leave a note for this date. Every wrestler starts unmarked \u2014 use Mark All Present for a normal practice and then adjust exceptions, which is far faster than marking individually. Lates are weighted, not free: on the Admin page you set how many lates equal one absence, so if that is set to 3, three lates subtract the same from an athlete's rate as a single absence, and a late is never double-counted as an absence. Setting it to 0 leaves lates out of the rate entirely while still recording them. Whether Excused absences count against the rate is also an Admin setting.",
       "sheet_varsity_dual": "Each row is one match. Click anywhere on a row to open its full Match Log \u2014 that is where you review every scored action and delete a match outright if it was scored on the wrong athlete or needs to be rescored from scratch. Click directly on the result text to edit a time without opening the log: pin times and technical fall times are both editable that way. Team points are calculated from the result and roll up into the dual score automatically, so correcting a result here corrects the team score too."
     };
@@ -10262,7 +10507,56 @@
       try { toast("Clip server marked disconnected. Auto-Clip will not send until you Connect again.", "info", 4000); } catch (e) {}
     }
 
-    async function testClipServerConnection() {
+    
+    let _clipSoftCheckInFlight = false;
+    async function softCheckClipServer() {
+      if (_clipSoftCheckInFlight) return;
+      if (typeof CLIP_SERVER_URL === "undefined") return;
+      _clipSoftCheckInFlight = true;
+      try {
+        const url = (typeof getClipServerUrl === "function" ? getClipServerUrl() : CLIP_SERVER_URL) || "http://localhost:5057";
+        const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const t = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, 2500);
+        const res = await fetch(url.replace(/\/$/, "") + "/health", {
+          method: "GET",
+          signal: ctrl ? ctrl.signal : undefined
+        });
+        clearTimeout(t);
+        if (res.ok) {
+          clipServerConnected = true;
+          clipServerLastCheckAt = Date.now();
+          const body = await res.json().catch(function () { return {}; });
+          clipServerStatusDetail = "Connected · " + (body.version || body.status || "OK") + " · " + url;
+        } else {
+          clipServerConnected = false;
+          clipServerStatusDetail = "Not reachable (HTTP " + res.status + ")";
+        }
+      } catch (e) {
+        clipServerConnected = false;
+        if (!clipServerStatusDetail || /Connected/i.test(clipServerStatusDetail)) {
+          clipServerStatusDetail = "Not connected — start the SW launcher (clip server on 5057), then Connect.";
+        }
+      }
+      _clipSoftCheckInFlight = false;
+      try {
+        if (typeof updateClipServerStatusUI === "function") updateClipServerStatusUI();
+        // Re-render admin clip pill if still on admin
+        const pill = document.getElementById("clip-server-pill");
+        if (pill) {
+          pill.textContent = clipServerConnected ? "Connected" : "Not connected";
+          pill.style.borderColor = clipServerConnected ? "var(--green)" : "var(--red)";
+          pill.style.color = clipServerConnected ? "var(--green)" : "var(--red)";
+          pill.style.background = clipServerConnected ? "var(--greenDim, rgba(80,180,80,0.2))" : "rgba(180,60,60,0.15)";
+        }
+        const st = document.getElementById("clip-server-status");
+        if (st) {
+          st.textContent = clipServerStatusDetail || (clipServerConnected ? "Connected" : "Not connected");
+          st.style.color = clipServerConnected ? "var(--green)" : "var(--muted)";
+        }
+      } catch (e2) {}
+    }
+
+async function testClipServerConnection() {
       return connectClipServer();
     }
 
@@ -13606,7 +13900,7 @@ function computeRawStatsBundle(wrestlerId) {
 
       return {
         scope: isCareer ? "career" : "season",
-        seasonLabel: isCareer ? "Career (Varsity)" : "Best single seasons (Varsity, all years)",
+        seasonLabel: isCareer ? "Career Record Holders (Varsity)" : "Single Season Record Holders (Varsity)",
         byWeight,
         weightClasses,
         categories
@@ -13671,10 +13965,16 @@ function computeRawStatsBundle(wrestlerId) {
           Viewing: <strong style="color:var(--gold);">${swEsc(data.seasonLabel)}</strong>
           · Varsity / starters only
         </div>
-        <div class="sec-label" style="margin:12px 0 8px;">Weight Class Records</div>
-        ${weightHtml}
-        <div class="sec-label" style="margin:16px 0 8px;">Scoring Records</div>
-        ${catHtml}
+        <div class="record-book-grid" style="display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px 20px; align-items:start;">
+          <div style="min-width:0;">
+            <div class="sec-label" style="margin:4px 0 8px;">Weight Class Records</div>
+            ${weightHtml}
+          </div>
+          <div style="min-width:0;">
+            <div class="sec-label" style="margin:4px 0 8px;">Scoring Records</div>
+            ${catHtml}
+          </div>
+        </div>
       `;
     }
 
@@ -14990,8 +15290,14 @@ function computeRawStatsBundle(wrestlerId) {
       target.innerHTML = `
         <div class="card">
           <div class="card-title">
-            <span>Team Calendar</span>
-            ${helpIcon('calendar_tab')}
+            <span style="display:inline-flex; align-items:center; gap:10px; flex-wrap:wrap;">
+              <span>Team Calendar</span>
+              ${helpIcon('calendar_tab')}
+              <label style="display:inline-flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk); cursor:pointer; margin:0; font-weight:500;">
+                <input type="checkbox" ${(appConfig.printScheduleHolidays === true) ? "checked" : ""} onchange="appConfig.printScheduleHolidays = this.checked; persist();" />
+                Holidays on printed schedule
+              </label>
+            </span>
           </div>
           <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:10px;">
             ${months.map(m => {
@@ -15006,10 +15312,6 @@ function computeRawStatsBundle(wrestlerId) {
               <input type="month" id="cal-add-month" class="input" style="display:none; width:auto; margin:0 0 0 4px; font-size:12px;"
                 onchange="addCalendarMonth(this.value); this.style.display='none';" />
             </span>
-            <label style="display:inline-flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk); cursor:pointer; margin:0;">
-              <input type="checkbox" ${(appConfig.printScheduleHolidays === true) ? "checked" : ""} onchange="appConfig.printScheduleHolidays = this.checked; persist();" />
-              Holidays on printed schedule
-            </label>
             <select class="select" style="width:auto; margin:0; font-size:11px;" onchange="boutDivisionFilter = this.value; render();">
               <option value="All" ${boutDivisionFilter === 'All' ? 'selected' : ''}>All Divisions</option>
               <option value="Boys" ${boutDivisionFilter === 'Boys' ? 'selected' : ''}>${swEsc((typeof divisionDisplayName === 'function' ? divisionDisplayName('Boys') : 'Boys') + ' Only')}</option>
@@ -15024,7 +15326,7 @@ function computeRawStatsBundle(wrestlerId) {
               <option value="selected">Selected month</option>
               <option value="all">All calendar months</option>
             </select>
-            <button class="btn btn-gold" style="font-size:11px;" onclick="printCalendarMonth()" ${!ym && !(months && months.length) ? 'disabled' : ''}>🖨 Print Calendar</button>
+            <button class="btn btn-gold" style="padding:4px 10px; font-size:10px;" onclick="printCalendarMonth()" ${!ym && !(months && months.length) ? 'disabled' : ''}>Print Calendar</button>
           </div>
           ${!ym ? `<p style="color:var(--muted); font-size:12px;">Add a month tab to begin. Click any day to take attendance or create an event.</p>` : `
             <div style="font-size:14px; font-weight:800; color:var(--gold); margin-bottom:4px;">${swEsc(monthNames[month-1])} ${swEsc(year)}</div>
@@ -15491,7 +15793,7 @@ const teamOpsBody = `
             <p style="font-size:12px; margin:0 0 8px 0;">Status: <strong>${typeof licenseStatusLabel === "function" ? licenseStatusLabel() : "—"}</strong></p>
             <button type="button" class="btn btn-gold" style="font-size:11px; margin-bottom:8px;" onclick="openLicenseModal()">Enter activation key</button>
             <p style="font-size:10px; color:var(--muted); margin:0 0 10px 0;">
-              90-day trial on first launch. After expiry, enter a license key.
+              90-day trial is stored in Supabase (device + Google email). After expiry, enter a license key. Run the trials table SQL once in Supabase (see diagnostics or docs).
               With Supabase configured, keys are checked online (seats + expiry) and bound to a Google email.
             </p>
             <div class="sec-label" style="margin-top:8px;">Supabase (licensing + presence)</div>
@@ -16844,9 +17146,11 @@ const aiBody = `
               <p style="font-size:11px; color:var(--muted); margin-bottom:10px;">
                 You can always export a backup from Admin.
                 ${typeof supabaseConfigured === "function" && supabaseConfigured()
-                  ? "This build validates keys online (Supabase) and binds the license to your Google email."
+                  ? "This build validates keys online (Supabase), binds paid licenses to your Google email, and records the 90-day trial on the server (device + Google email) so clearing browser data does not reset the trial when you reconnect."
                   : "License server is not configured in this build."}
+                ${!activated && state.trialSource === "supabase" ? " Trial clock is server-backed." : ""}
               </p>
+              ${!activated ? `<p style="font-size:10px; color:var(--muted); margin-bottom:10px;">Connect Google Drive once so the trial is tied to your Google account as well as this device.</p>` : ""}
               ${activated ? "" : `
                 <label class="field-label">Activation key</label>
                 <input id="license-key-input" class="input" placeholder="Enter your license key" style="font-family:monospace; letter-spacing:1px;" />
@@ -17090,6 +17394,48 @@ const aiBody = `
               <div style="display:flex; gap:8px; margin-top:12px;">
                 <button class="btn btn-green" style="flex:2;" onclick="saveNewSeason()">Create Season</button>
                 <button class="btn btn-red" style="flex:1;" onclick="closeModal()">Cancel</button>
+              </div>
+            </div>
+          </div>
+        `;
+        return;
+      }
+
+      if (activeModal === "gdrive-connect-prompt") {
+        root.innerHTML = `
+          <div class="modal-overlay">
+            <div class="modal-box" style="max-width:440px;" onclick="event.stopPropagation()">
+              <div class="card-title">Connect Google Drive</div>
+              <p style="font-size:13px; color:var(--chalk); line-height:1.45; margin:0 0 12px 0;">
+                Connect Drive to save and load team backups in the cloud. Browsers block automatic sign-in pop-ups, so connect with the button below (one click).
+              </p>
+              <p style="font-size:11px; color:var(--muted); margin:0 0 14px 0;">
+                You can also connect anytime from the <strong>G</strong> badge in the top bar or Admin → Google Drive.
+              </p>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button class="btn btn-green" style="flex:2;" onclick="closeModal(); connectGoogleDriveThenOfferLoad();">Connect Google Drive</button>
+                <button class="btn" style="flex:1; background:var(--panelLine); color:var(--chalk);" onclick="closeModal(); offerLoadLatestBackupPrompt();">Not now</button>
+              </div>
+            </div>
+          </div>
+        `;
+        return;
+      }
+
+      if (activeModal === "load-latest-backup-prompt") {
+        root.innerHTML = `
+          <div class="modal-overlay">
+            <div class="modal-box" style="max-width:440px;" onclick="event.stopPropagation()">
+              <div class="card-title">Load latest backup?</div>
+              <p style="font-size:13px; color:var(--chalk); line-height:1.45; margin:0 0 12px 0;">
+                Load the most recent full backup from Google Drive and/or your local Strategic Wrestler folder so this device matches the latest team data.
+              </p>
+              <p style="font-size:11px; color:var(--muted); margin:0 0 14px 0;">
+                This replaces data currently in this browser for the program. Use top-bar Save first if you have unsaved local-only work you need to keep.
+              </p>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button class="btn btn-green" style="flex:2;" onclick="closeModal(); try { autoLoadMostRecentBackup(true, true); } catch (e) {}">Load latest</button>
+                <button class="btn" style="flex:1; background:var(--panelLine); color:var(--chalk);" onclick="closeModal()">Skip</button>
               </div>
             </div>
           </div>
@@ -21313,6 +21659,14 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-18-supabase-trial",
+        items: [
+          "90-day trial synced to Supabase (trials table) by device id and Google email — clearing browser data no longer resets trial when the same account/device reconnects",
+          "Connect Google Drive to bind trial to email; trial status still works offline using last synced start date"
+        ]
+      },
+
       {
         build: "2026-10-18-idle-autosave",
         items: [
