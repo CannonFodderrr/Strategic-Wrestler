@@ -2235,9 +2235,11 @@
     /** Competition weight for the open / next scout match (may differ from roster weight when bumping up). */
     let scoutMatchWeightClass = null;
 
-    let statsMode = "stats"; // 'stats' | 'leaderboard' | 'halloffame'
+    let statsMode = "stats"; // 'stats' | 'leaderboard' | 'halloffame' | 'recordbook'
     let hallOfFameYearFilter = "all"; // 'all' | specific year label
     let hallOfFameStyleFilter = "all"; // 'all' | Folkstyle | Freestyle | Greco
+    let recordBookScope = "season"; // 'season' | 'career'
+    let recordBookExpanded = {}; // sectionKey -> true when showing top 10
     let adminHofYearFilter = null; // null = default current season year
     let leaderboardMoveModal = null; // { category, move, isOffense, division, level }
     let leaderboardDivision = "All"; // 'All', 'Boys', 'Girls'
@@ -12686,6 +12688,9 @@ function computeRawStatsBundle(wrestlerId) {
               <button class="btn" style="padding:4px 10px; font-size:11px; font-weight:800; background:${statsMode === 'halloffame' ? 'var(--gold)' : 'var(--mat)'}; color:${statsMode === 'halloffame' ? 'var(--mat)' : 'var(--chalk)'}; border:1px solid var(--panelLine);" onclick="statsMode = 'halloffame'; render();">
                 👑 Hall of Fame
               </button>
+              <button class="btn" style="padding:4px 10px; font-size:11px; font-weight:800; background:${statsMode === 'recordbook' ? 'var(--gold)' : 'var(--mat)'}; color:${statsMode === 'recordbook' ? 'var(--mat)' : 'var(--chalk)'}; border:1px solid var(--panelLine);" onclick="statsMode = 'recordbook'; render();">
+                📖 Record Book
+              </button>
             </div>
 
             ${statsMode === 'stats' ? `
@@ -12743,6 +12748,20 @@ function computeRawStatsBundle(wrestlerId) {
               </span>
             </div>
             ${renderHallOfFameView()}
+          </div>
+        ` : statsMode === 'recordbook' ? `
+          <div class="card">
+            <div class="card-title">
+              <span>Record Book</span>
+              <span style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                ${helpIcon('stats_recordbook')}
+                <button class="btn" style="padding:4px 10px; font-size:10px; font-weight:800; background:${recordBookScope === 'season' ? 'var(--gold)' : 'var(--mat)'}; color:${recordBookScope === 'season' ? 'var(--mat)' : 'var(--chalk)'}; border:1px solid var(--panelLine);" onclick="recordBookScope = 'season'; render();">Single Season</button>
+                <button class="btn" style="padding:4px 10px; font-size:10px; font-weight:800; background:${recordBookScope === 'career' ? 'var(--gold)' : 'var(--mat)'}; color:${recordBookScope === 'career' ? 'var(--mat)' : 'var(--chalk)'}; border:1px solid var(--panelLine);" onclick="recordBookScope = 'career'; render();">Career</button>
+                <button class="btn btn-gold" style="padding:4px 10px; font-size:10px;" onclick="printRecordBook()">Print</button>
+              </span>
+            </div>
+            <p style="font-size:11px; color:var(--muted); margin:0 0 10px 0;">Top 3 shown — click a row to expand to top 10. Career ranks use every season stored in this program and stay with your backup save.</p>
+            ${renderRecordBookView()}
           </div>
         ` : `
           <div class="card">
@@ -13108,6 +13127,311 @@ function computeRawStatsBundle(wrestlerId) {
       w.document.write(html);
       w.document.close();
     }
+
+    function recordBookSeasonLabel(season) {
+      if (!season) return "";
+      const n = String(season.name || "").trim();
+      if (n) return n;
+      return String(season.id || "Season");
+    }
+
+    function recordBookNormalizeName(name) {
+      return String(name || "").trim().toLowerCase().replace(/\s+/g, " ");
+    }
+
+    /** Per-wrestler stats for a single season object (not limited by active bout filter). */
+    function computeRecordBookAthleteStats(season, wrestlerId) {
+      if (!season || !wrestlerId) {
+        return { wins: 0, losses: 0, ties: 0, td: 0, nf: 0, rev: 0, esc: 0, pins: 0, tech: 0 };
+      }
+      const wrestler = (season.roster || []).find(w => w.id === wrestlerId);
+      const matches = (season.matches || []).filter(m => m.wrestlerId === wrestlerId);
+      const events = (season.events || []).filter(e => e.wrestlerId === wrestlerId);
+      let wins = 0, losses = 0, ties = 0, pins = 0, tech = 0;
+      matches.forEach(m => {
+        const evs = events.filter(e => e.matchId === m.id);
+        const r = classifyMatchResult(evs);
+        const countRecord = wrestler ? shouldCountMatchForRecord(m, wrestler) : true;
+        if (!countRecord) return;
+        if (r.result === "win") {
+          wins++;
+          if (r.method === "pin") pins++;
+          else if (r.method === "tech") tech++;
+        } else if (r.result === "loss") losses++;
+        else if (r.result === "tie") ties++;
+      });
+      const countMove = (cat, dir, outcome) => events.filter(e => {
+        if (e.category !== cat) return false;
+        if (dir && e.direction !== dir) return false;
+        if (outcome && e.outcome !== outcome) return false;
+        return true;
+      }).length;
+      const nfNames = ["2-Point NF", "Near Fall 2", "NF2", "3-Point NF", "Near Fall 3", "NF3", "4-Point NF", "Near Fall 4", "NF4", "5-Point NF", "Near Fall 5", "NF5"];
+      const td = countMove("Takedown", "offense", "success");
+      const nf = events.filter(e =>
+        e.category === "Near Fall / Pin" && e.direction === "offense" && e.outcome === "success" &&
+        nfNames.some(n => String(e.move || "").includes(n.replace("Near Fall ", "NF").slice(0, 3)) || nfNames.includes(e.move))
+      ).length;
+      // Simpler NF count: any successful offense near fall / pin category that is not a pin win event
+      const nf2 = events.filter(e => e.category === "Near Fall / Pin" && e.direction === "offense" && e.outcome === "success" && /nf|near\s*fall/i.test(String(e.move || e.detail || ""))).length;
+      const rev = countMove("Reversal", "offense", "success");
+      const esc = countMove("Escape", "offense", "success");
+      return {
+        wins, losses, ties,
+        td,
+        nf: nf2,
+        rev, esc, pins, tech
+      };
+    }
+
+    function buildRecordBookData(scope) {
+      const isCareer = scope === "career";
+      const seasons = isCareer
+        ? ((store && store.seasons) || []).slice()
+        : [getActiveSeason()].filter(Boolean);
+
+      // key -> aggregate
+      const byKey = {};
+      seasons.forEach(season => {
+        if (!season) return;
+        const yearLabel = recordBookSeasonLabel(season);
+        (season.roster || []).forEach(w => {
+          if (!w || !w.id) return;
+          const key = recordBookNormalizeName(w.name);
+          if (!key) return;
+          const st = computeRecordBookAthleteStats(season, w.id);
+          if (!byKey[key]) {
+            byKey[key] = {
+              name: w.name,
+              years: [],
+              weightClass: w.weightClass || "",
+              division: w.division || "Boys",
+              wins: 0, losses: 0, ties: 0,
+              td: 0, nf: 0, rev: 0, esc: 0, pins: 0, tech: 0,
+              weightYears: {}
+            };
+          }
+          const agg = byKey[key];
+          if (yearLabel && !agg.years.includes(yearLabel)) agg.years.push(yearLabel);
+          agg.wins += st.wins;
+          agg.losses += st.losses;
+          agg.ties += st.ties;
+          agg.td += st.td;
+          agg.nf += st.nf;
+          agg.rev += st.rev;
+          agg.esc += st.esc;
+          agg.pins += st.pins;
+          agg.tech += st.tech;
+          const wc = String(w.weightClass || "").trim() || "—";
+          if (!agg.weightYears[wc]) agg.weightYears[wc] = { wins: 0, losses: 0, ties: 0, years: [] };
+          agg.weightYears[wc].wins += st.wins;
+          agg.weightYears[wc].losses += st.losses;
+          agg.weightYears[wc].ties += st.ties;
+          if (yearLabel && !agg.weightYears[wc].years.includes(yearLabel)) agg.weightYears[wc].years.push(yearLabel);
+          // Prefer most recent / highest-match weight for display
+          if (w.weightClass) agg.weightClass = w.weightClass;
+        });
+      });
+
+      const athletes = Object.keys(byKey).map(k => {
+        const a = byKey[k];
+        a.years.sort();
+        a.yearStr = a.years.length <= 2 ? a.years.join(", ") : (a.years[0] + "–" + a.years[a.years.length - 1]);
+        a.recordStr = a.ties > 0 ? (a.wins + "-" + a.losses + "-" + a.ties) : (a.wins + "-" + a.losses);
+        a.decided = a.wins + a.losses;
+        a.winPct = a.decided > 0 ? (a.wins / a.decided) : 0;
+        return a;
+      });
+
+      // Weight-class records: best W-L at each weight
+      const weightMap = {};
+      athletes.forEach(a => {
+        Object.keys(a.weightYears || {}).forEach(wc => {
+          const slot = a.weightYears[wc];
+          if (!weightMap[wc]) weightMap[wc] = [];
+          const decided = slot.wins + slot.losses;
+          weightMap[wc].push({
+            name: a.name,
+            years: (slot.years || []).slice().sort(),
+            yearStr: (slot.years || []).length <= 2 ? (slot.years || []).join(", ") : ((slot.years || [])[0] + "–" + (slot.years || []).slice(-1)[0]),
+            weightClass: wc,
+            wins: slot.wins,
+            losses: slot.losses,
+            ties: slot.ties,
+            recordStr: slot.ties > 0 ? (slot.wins + "-" + slot.losses + "-" + slot.ties) : (slot.wins + "-" + slot.losses),
+            decided,
+            winPct: decided > 0 ? slot.wins / decided : 0
+          });
+        });
+      });
+      const weightClasses = Object.keys(weightMap).sort((a, b) => (Number(a) || 0) - (Number(b) || 0) || String(a).localeCompare(String(b)));
+      const byWeight = {};
+      weightClasses.forEach(wc => {
+        byWeight[wc] = weightMap[wc]
+          .filter(x => x.decided > 0 || x.wins > 0)
+          .sort((a, b) => b.wins - a.wins || b.winPct - a.winPct || a.losses - b.losses || a.name.localeCompare(b.name));
+      });
+
+      function rankStat(getter) {
+        return athletes
+          .map(a => ({
+            name: a.name,
+            years: a.years,
+            yearStr: a.yearStr,
+            weightClass: a.weightClass,
+            value: getter(a),
+            recordStr: a.recordStr
+          }))
+          .filter(x => x.value > 0)
+          .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name));
+      }
+
+      return {
+        scope: isCareer ? "career" : "season",
+        seasonLabel: isCareer ? "Career" : recordBookSeasonLabel(getActiveSeason()),
+        byWeight,
+        weightClasses,
+        categories: [
+          { key: "td", title: "Takedowns", rows: rankStat(a => a.td) },
+          { key: "nf", title: "Near Falls", rows: rankStat(a => a.nf) },
+          { key: "rev", title: "Reversals", rows: rankStat(a => a.rev) },
+          { key: "esc", title: "Escapes", rows: rankStat(a => a.esc) },
+          { key: "pins", title: "Pins", rows: rankStat(a => a.pins) },
+          { key: "tech", title: "Tech Falls", rows: rankStat(a => a.tech) }
+        ]
+      };
+    }
+
+    function toggleRecordBookSection(sectionKey) {
+      recordBookExpanded[sectionKey] = !recordBookExpanded[sectionKey];
+      render();
+    }
+
+    function renderRecordBookSection(title, sectionKey, rows, valueLabel) {
+      const expanded = !!recordBookExpanded[sectionKey];
+      const limit = expanded ? 10 : 3;
+      const list = (rows || []).slice(0, limit);
+      const more = (rows || []).length > 3;
+      if (!list.length) {
+        return `<div style="margin-bottom:14px;">
+          <div class="sec-label" style="margin-bottom:6px;">${swEsc(title)}</div>
+          <p style="font-size:12px; color:var(--muted); margin:0;">No data yet.</p>
+        </div>`;
+      }
+      return `<div style="margin-bottom:14px;">
+        <div class="sec-label" style="margin-bottom:6px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <span>${swEsc(title)}</span>
+          ${more ? `<button type="button" class="btn" style="padding:2px 8px; font-size:10px; background:var(--panelLine); color:var(--chalk);" onclick="toggleRecordBookSection('${swJs(sectionKey)}')">${expanded ? "Show top 3" : "Show top 10"}</button>` : ""}
+        </div>
+        <div style="border:1px solid var(--panelLine); border-radius:8px; overflow:hidden;">
+          ${list.map((r, idx) => `
+            <div class="item-row" style="padding:8px 10px; margin:0; border-radius:0; border-bottom:1px solid var(--panelLine); cursor:${more ? "pointer" : "default"};"
+              ${more ? `onclick="toggleRecordBookSection('${swJs(sectionKey)}')"` : ""}>
+              <div style="display:flex; align-items:baseline; gap:10px; flex:1; min-width:0;">
+                <span style="font-weight:900; color:var(--gold); width:22px;">${idx + 1}.</span>
+                <div style="min-width:0;">
+                  <div style="font-weight:800; color:var(--chalk);">${swEsc(r.name)}</div>
+                  <div style="font-size:11px; color:var(--muted);">${swEsc(r.yearStr || "")}${r.weightClass ? " · " + swEsc(r.weightClass) + " lbs" : ""}</div>
+                </div>
+              </div>
+              <div style="font-weight:900; color:var(--gold); white-space:nowrap;">${swEsc(valueLabel ? valueLabel(r) : r.value)}</div>
+            </div>
+          `).join("")}
+        </div>
+      </div>`;
+    }
+
+    function renderRecordBookView() {
+      const data = buildRecordBookData(recordBookScope);
+      let weightHtml = "";
+      if (!(data.weightClasses || []).length) {
+        weightHtml = `<p style="font-size:12px; color:var(--muted);">No weight-class records yet. Commit matches to build the book.</p>`;
+      } else {
+        weightHtml = data.weightClasses.map(wc => {
+          const rows = data.byWeight[wc] || [];
+          return renderRecordBookSection(
+            wc + " lbs — Win/Loss",
+            "wt-" + wc,
+            rows,
+            r => r.recordStr
+          );
+        }).join("");
+      }
+      const catHtml = (data.categories || []).map(c =>
+        renderRecordBookSection(c.title, "cat-" + c.key, c.rows, r => String(r.value))
+      ).join("");
+      return `
+        <div style="margin-bottom:8px; font-size:12px; color:var(--muted);">
+          Viewing: <strong style="color:var(--gold);">${swEsc(data.seasonLabel)}</strong>
+        </div>
+        <div class="sec-label" style="margin:12px 0 8px;">Weight Class Records</div>
+        ${weightHtml}
+        <div class="sec-label" style="margin:16px 0 8px;">Scoring Records</div>
+        ${catHtml}
+      `;
+    }
+
+    function printRecordBook() {
+      const data = buildRecordBookData(recordBookScope);
+      const team = (branding && branding.teamName) ? branding.teamName : "Strategic Wrestler";
+      const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const scopeTitle = data.scope === "career" ? "Career Record Book" : ("Record Book — " + data.seasonLabel);
+
+      function sectionTable(title, rows, valHeader, valFn) {
+        const list = (rows || []).slice(0, 10);
+        if (!list.length) return `<h3>${esc(title)}</h3><p style="color:#666;font-size:12px;">No data.</p>`;
+        return `<h3>${esc(title)}</h3>
+          <table>
+            <thead><tr><th>#</th><th>Name</th><th>Year(s)</th><th>Weight</th><th>${esc(valHeader)}</th></tr></thead>
+            <tbody>
+              ${list.map((r, i) => `<tr>
+                <td>${i + 1}</td>
+                <td>${esc(r.name)}</td>
+                <td>${esc(r.yearStr || "")}</td>
+                <td>${esc(r.weightClass || "")}</td>
+                <td>${esc(valFn(r))}</td>
+              </tr>`).join("")}
+            </tbody>
+          </table>`;
+      }
+
+      let body = "";
+      (data.weightClasses || []).forEach(wc => {
+        body += sectionTable(wc + " lbs — Win/Loss", data.byWeight[wc], "Record", r => r.recordStr);
+      });
+      (data.categories || []).forEach(c => {
+        body += sectionTable(c.title, c.rows, "Total", r => String(r.value));
+      });
+
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>${esc(team)} — ${esc(scopeTitle)}</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; color:#111; margin:24px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:14px; color:#444; margin:0 0 16px; }
+  h3 { font-size:13px; margin:18px 0 8px; border-bottom:1px solid #ddd; padding-bottom:4px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; margin-bottom:8px; }
+  th, td { border:1px solid #ccc; padding:5px 8px; text-align:left; }
+  th { background:#f3f4f6; font-size:10px; text-transform:uppercase; }
+  .meta { font-size:11px; color:#666; margin-bottom:12px; }
+  @media print { body { margin:12px; } }
+</style></head><body>
+  <h1>${esc(team)}</h1>
+  <h2>${esc(scopeTitle)}</h2>
+  <div class="meta">Printed ${new Date().toLocaleDateString()} · Top 10 per category</div>
+  ${body}
+  <script>window.onload=function(){window.print();};<\/script>
+</body></html>`;
+
+      const w = window.open("", "_blank");
+      if (!w) {
+        toast("Pop-up blocked. Allow pop-ups to print the Record Book.");
+        return;
+      }
+      w.document.open();
+      w.document.write(html);
+      w.document.close();
+    }
+
 
     function buildLeaderboardPrintHtml(side) {
       const season = getActiveSeason();
@@ -18688,6 +19012,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         layoutOrder, adminSectionHidden, ourWrestlerAppearance, moveStyleTags,
         modifierStyleTags: (typeof modifierStyleTags !== "undefined") ? modifierStyleTags : undefined,
         aiTrainingPlanCache: (typeof aiTrainingPlanCache !== "undefined" && aiTrainingPlanCache) ? aiTrainingPlanCache : {},
+        recordBookSnapshot: (typeof buildRecordBookData === "function") ? { season: buildRecordBookData("season"), career: buildRecordBookData("career") } : null,
         // Explicit aliases for clarity (same data lives in store for seasons/roster/matches/events/calendar)
         note: "store includes seasons (roster, bouts/events, matches, scoring events, attendance/calendar). Also: taxonomy, weights, branding, theme, appConfig, awards, gear, opponent memory, AI training library + plan cache."
       };
@@ -20672,6 +20997,17 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
     const MAT_SCOUT_CHANGELOG = [
       {
+        build: "2026-10-17-record-book",
+        items: [
+          "Stats: Record Book next to Hall of Fame — weight-class W/L and scoring records (Takedowns, Near Falls, Reversals, Escapes, Pins, Tech Falls)",
+          "Record Book shows top 3; click a section to expand to top 10; Single Season / Career toggle",
+          "Career ranks use every season stored in the program and print per scope; included in full Save backup snapshot",
+          "Print Schedule: holidays and same-day custom entries combine (e.g. Christmas Day, No Practice)",
+          "Calendar Print Schedule matches Roster Print Schedule"
+        ]
+      },
+
+      {
         build: "2026-10-12-schedule-branding",
         items: [
           "Google Drive G-badge connect: OAuth Client ID is built-in (no paste field)",
@@ -20721,15 +21057,6 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           "Scout and AI Scout: Match Level, Select Opponent from Event Roster, Custom Opponent Name",
           "Training Plan modifiers relabeled Our Ties and Opponent Ties",
           "Calendar help corrected for combined Boys/Girls events"
-        ]
-      },
-      {
-        build: "2026-09-16-storage-presence",
-        items: [
-          "IndexedDB storage path with recovery snapshots",
-          "Google Drive team folder structure (Backups, Exports, Archives, AI Library, MatScorer)",
-          "License activation via Supabase seats",
-          "Storage Health panel — usage, last save, full backup export"
         ]
       },
     
