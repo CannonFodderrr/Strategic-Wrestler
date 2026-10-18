@@ -2238,8 +2238,19 @@
     let statsMode = "stats"; // 'stats' | 'leaderboard' | 'halloffame' | 'recordbook'
     let hallOfFameYearFilter = "all"; // 'all' | specific year label
     let hallOfFameStyleFilter = "all"; // 'all' | Folkstyle | Freestyle | Greco
-    let recordBookScope = "season"; // 'season' | 'career'
+    let recordBookScope = "season"; // 'season' | 'career'  (season = best single-season marks all-time)
+    let recordBookDivision = "All"; // 'All' | 'Boys' | 'Girls'
+    let recordBookIncludeExh = false; // when true, Exh matches count in Record Book
     let recordBookExpanded = {}; // sectionKey -> true when showing top 10
+    /** Persistent record book (survives season switches; included in Save). Varsity only. */
+    let recordBook = { singleSeason: {}, career: {}, updatedAt: null };
+    const RECORD_BOOK_KEY = "sw-record-book-v1";
+    let presenceLastActivityAt = Date.now();
+    let presenceWasViewOnly = false;
+    let autoSaveTimer = null;
+    const PRESENCE_IDLE_MS = 30 * 60 * 1000; // no input for 30 min → idle (still heartbeats while tab open)
+    const AUTO_SAVE_CHECK_MS = 60 * 1000; // check idle status every minute
+    let autoSaveIdleFired = false; // one auto-save per idle stretch
     let adminHofYearFilter = null; // null = default current season year
     let leaderboardMoveModal = null; // { category, move, isOffense, division, level }
     let leaderboardDivision = "All"; // 'All', 'Boys', 'Girls'
@@ -4069,6 +4080,7 @@
         presenceOthers = [];
         presenceIAmEditor = true;
         updatePresenceBar();
+        try { if (typeof onPresenceEditorSeatChanged === "function") onPresenceEditorSeatChanged(); } catch (e) {}
         return;
       }
       const state = ensureLicenseState();
@@ -4193,6 +4205,160 @@
         '<span class="sw-presence-dot"></span>' +
         "<span><strong>You are editing.</strong> Also viewing: " + (names || "—") + "</span>";
     }
+
+
+    function noteUserActivity() {
+      presenceLastActivityAt = Date.now();
+      autoSaveIdleFired = false; // new activity → allow another idle auto-save later
+    }
+    try {
+      ["mousemove", "keydown", "pointerdown", "touchstart", "scroll"].forEach(function (ev) {
+        document.addEventListener(ev, noteUserActivity, { passive: true });
+      });
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible") noteUserActivity();
+      });
+    } catch (e) {}
+
+    function isUserActivelyUsingSw() {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return false;
+      return (Date.now() - (presenceLastActivityAt || 0)) < PRESENCE_IDLE_MS;
+    }
+
+    function ensureAutoSaveTimer() {
+      if (autoSaveTimer) return;
+      autoSaveTimer = setInterval(function () {
+        try {
+          if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly()) return;
+          // Auto-save once when the user has been idle for 30 minutes
+          if (isUserActivelyUsingSw()) return;
+          if (autoSaveIdleFired) return;
+          autoSaveIdleFired = true;
+          if (typeof saveSharedSeasonData === "function") {
+            saveSharedSeasonData().then(function () {
+              try { toast("Auto-saved (idle 30 min).", "success", 3000); } catch (e) {}
+            }).catch(function () {});
+          }
+        } catch (e) {}
+      }, AUTO_SAVE_CHECK_MS);
+    }
+
+    /**
+     * Quietly load the newest backup from Drive and/or local folder.
+     * @param {boolean} silent  if true, only toast on success/failure briefly
+     */
+    async function autoLoadMostRecentBackup(silent) {
+      try {
+        if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly()) return;
+
+        // Do not overwrite non-empty local data on quiet boot unless backup is clearly newer
+        try {
+          const season = typeof getActiveSeason === "function" ? getActiveSeason() : null;
+          const hasLocal = season && ((season.roster || []).length > 0 || (season.matches || []).length > 0);
+          if (silent && hasLocal) {
+            // Still allow editor-seat takeover loads (silent === false)
+            return;
+          }
+        } catch (e) {}
+
+        // Prefer Drive if we can connect
+        let driveFiles = [];
+        try {
+          if (typeof tryAutoConnectGoogleDrive === "function") {
+            await Promise.race([
+              tryAutoConnectGoogleDrive(),
+              new Promise(function (r) { setTimeout(r, 4000); })
+            ]);
+          }
+          if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
+            if (!(appConfig.googleDriveFolderId || "").trim() && typeof ensureGoogleDriveFolderStructure === "function") {
+              try { await ensureGoogleDriveFolderStructure(); } catch (e) {}
+            }
+            if (typeof listDriveBackups === "function") {
+              driveFiles = await listDriveBackups();
+            }
+          }
+        } catch (e) { console.warn("autoload drive", e); }
+
+        let bestDrive = null;
+        (driveFiles || []).forEach(function (f) {
+          if (!f || !/\.json$/i.test(f.name || "")) return;
+          if (!/backup|strategic-wrestler|mat-scout/i.test(f.name || "")) return;
+          if (!bestDrive || String(f.modifiedTime || "") > String(bestDrive.modifiedTime || "")) bestDrive = f;
+        });
+
+        // Local folder latest
+        let bestLocal = null;
+        try {
+          if (typeof localSwRootHandle !== "undefined" && localSwRootHandle) {
+            const backups = await localSwRootHandle.getDirectoryHandle("Backups", { create: false }).catch(function () { return null; });
+            if (backups) {
+              for await (const [name, handle] of backups.entries()) {
+                if (handle.kind !== "file" || !/\.json$/i.test(name)) continue;
+                if (!/backup|strategic-wrestler|mat-scout/i.test(name)) continue;
+                const file = await handle.getFile();
+                if (!bestLocal || file.lastModified > bestLocal.lastModified) {
+                  bestLocal = { name, file, lastModified: file.lastModified };
+                }
+              }
+            }
+          }
+        } catch (e) { console.warn("autoload local", e); }
+
+        const driveTs = bestDrive && bestDrive.modifiedTime ? Date.parse(bestDrive.modifiedTime) : 0;
+        const localTs = bestLocal ? bestLocal.lastModified : 0;
+
+        if (!driveTs && !localTs) return;
+
+        if (driveTs >= localTs && bestDrive) {
+          // load from drive
+          if (typeof driveFetch === "function") {
+            const meta = await driveFetch("/files/" + encodeURIComponent(bestDrive.id) + "?alt=media");
+            // driveFetch may return text
+            const data = typeof meta === "string" ? JSON.parse(meta) : meta;
+            if (data && typeof applyFullBackupPayload === "function") {
+              applyFullBackupPayload(data, { silent: !!silent });
+              if (!silent) toast("Loaded latest Drive backup: " + (bestDrive.name || ""), "success", 4000);
+              else toast("Auto-loaded latest backup (Drive).", "success", 3000);
+              return;
+            }
+          }
+        }
+        if (bestLocal) {
+          const textBody = await bestLocal.file.text();
+          const data = JSON.parse(textBody);
+          if (data && typeof applyFullBackupPayload === "function") {
+            applyFullBackupPayload(data, { silent: !!silent });
+            if (!silent) toast("Loaded latest local backup: " + bestLocal.name, "success", 4000);
+            else toast("Auto-loaded latest backup (local).", "success", 3000);
+          }
+        }
+      } catch (e) {
+        console.warn("autoLoadMostRecentBackup", e);
+      }
+    }
+
+    /** When presence flips from view-only → editor, load latest backup first. */
+    async function onPresenceEditorSeatChanged() {
+      try {
+        const vo = typeof isPresenceViewOnly === "function" && isPresenceViewOnly();
+        if (presenceWasViewOnly && !vo) {
+          // Became editor: save was already done by previous editor ideally; load latest
+          toast("You are now the editor. Loading latest backup…", "info", 4000);
+          try {
+            if (typeof saveSharedSeasonData === "function") {
+              // Optional: previous editor may have gone stale — our data may be old
+            }
+          } catch (e) {}
+          await autoLoadMostRecentBackup(false);
+        }
+        if (!vo && typeof isUserActivelyUsingSw === "function" && !isUserActivelyUsingSw()) {
+          // idle editor still holds seat until stale timeout
+        }
+        presenceWasViewOnly = vo;
+      } catch (e) {}
+    }
+
 
     function startPresenceSystem() {
       if (presenceTimer) return;
@@ -6612,18 +6778,30 @@
         }
       }
 
-      const includeHolidays = (appConfig && appConfig.printScheduleHolidays !== false);
+      const includeHolidays = (appConfig && appConfig.printScheduleHolidays === true);
       if (includeHolidays && typeof getUsHolidaysForYear === "function") {
         const years = new Set();
         (season.bouts || []).forEach(b => { if (b.date && b.date.length >= 4) years.add(Number(b.date.slice(0, 4))); });
         (season.calendarMonths || []).forEach(m => { if (m && m.length >= 4) years.add(Number(m.slice(0, 4))); });
         (season.calendarEntries || []).forEach(e => { if (e && e.date && e.date.length >= 4) years.add(Number(e.date.slice(0, 4))); });
         if (!years.size) years.add(new Date().getFullYear());
+        const monthSet = {};
+        (season.calendarMonths || []).forEach(m => { if (m) monthSet[m] = true; });
         years.forEach(y => {
           if (!y) return;
           const hol = getUsHolidaysForYear(y) || {};
           Object.keys(hol).forEach(md => {
-            addExtraPart(y + "-" + md, hol[md]);
+            const date = y + "-" + md;
+            const ym = date.slice(0, 7); // YYYY-MM
+            // Only holidays that fall on months present on the Calendar page
+            if (Object.keys(monthSet).length && !monthSet[ym]) return;
+            if (!Object.keys(monthSet).length) {
+              // No month tabs: fall back to months covered by bouts/customs
+              const hasAnyDate = (season.bouts || []).some(b => (b.date || "").slice(0, 7) === ym)
+                || (season.calendarEntries || []).some(e => (e.date || "").slice(0, 7) === ym);
+              if (!hasAnyDate) return;
+            }
+            addExtraPart(date, hol[md]);
           });
         });
       }
@@ -12757,10 +12935,19 @@ function computeRawStatsBundle(wrestlerId) {
                 ${helpIcon('stats_recordbook')}
                 <button class="btn" style="padding:4px 10px; font-size:10px; font-weight:800; background:${recordBookScope === 'season' ? 'var(--gold)' : 'var(--mat)'}; color:${recordBookScope === 'season' ? 'var(--mat)' : 'var(--chalk)'}; border:1px solid var(--panelLine);" onclick="recordBookScope = 'season'; render();">Single Season</button>
                 <button class="btn" style="padding:4px 10px; font-size:10px; font-weight:800; background:${recordBookScope === 'career' ? 'var(--gold)' : 'var(--mat)'}; color:${recordBookScope === 'career' ? 'var(--mat)' : 'var(--chalk)'}; border:1px solid var(--panelLine);" onclick="recordBookScope = 'career'; render();">Career</button>
+                <select class="select" style="margin-bottom:0; width:auto; font-size:11px;" onchange="recordBookDivision = this.value; render();">
+                  <option value="All" ${recordBookDivision === 'All' ? 'selected' : ''}>All</option>
+                  <option value="Boys" ${recordBookDivision === 'Boys' ? 'selected' : ''}>${swEsc(typeof divisionDisplayName === 'function' ? divisionDisplayName('Boys') : 'Boys')}</option>
+                  <option value="Girls" ${recordBookDivision === 'Girls' ? 'selected' : ''}>${swEsc(typeof divisionDisplayName === 'function' ? divisionDisplayName('Girls') : 'Girls')}</option>
+                </select>
+                <label style="display:inline-flex; align-items:center; gap:5px; font-size:11px; color:var(--chalk); cursor:pointer; margin:0;">
+                  <input type="checkbox" ${recordBookIncludeExh ? "checked" : ""} onchange="recordBookIncludeExh = this.checked; try { refreshRecordBookFromAllSeasons(); } catch (e) {} render();" />
+                  Include Exh
+                </label>
                 <button class="btn btn-gold" style="padding:4px 10px; font-size:10px;" onclick="printRecordBook()">Print</button>
               </span>
             </div>
-            <p style="font-size:11px; color:var(--muted); margin:0 0 10px 0;">Top 3 shown — click a row to expand to top 10. Career ranks use every season stored in this program and stay with your backup save.</p>
+            <p style="font-size:11px; color:var(--muted); margin:0 0 10px 0;">Varsity/starters only. <strong>Single Season</strong> = best single-season marks across all years (records carry forward). <strong>Career</strong> = career totals. Top 3 shown — expand to top 10. Saved with top-bar Save.</p>
             ${renderRecordBookView()}
           </div>
         ` : `
@@ -13128,6 +13315,45 @@ function computeRawStatsBundle(wrestlerId) {
       w.document.close();
     }
 
+
+    function loadRecordBookFromStorage() {
+      try {
+        const raw = (typeof SWDB !== "undefined" && SWDB.getItem) ? SWDB.getItem(RECORD_BOOK_KEY) : localStorage.getItem(RECORD_BOOK_KEY);
+        if (!raw) return;
+        const data = JSON.parse(raw);
+        if (data && typeof data === "object") {
+          recordBook = {
+            singleSeason: data.singleSeason || {},
+            career: data.career || {},
+            updatedAt: data.updatedAt || null
+          };
+        }
+      } catch (e) { console.warn("loadRecordBook", e); }
+    }
+
+    function persistRecordBook() {
+      try {
+        recordBook.updatedAt = new Date().toISOString();
+        const raw = JSON.stringify(recordBook);
+        if (typeof SWDB !== "undefined" && SWDB.setItem) SWDB.setItem(RECORD_BOOK_KEY, raw);
+        else localStorage.setItem(RECORD_BOOK_KEY, raw);
+      } catch (e) { console.warn("persistRecordBook", e); }
+    }
+
+    function isVarsityWrestler(w) {
+      if (!w) return false;
+      const lv = String(w.level || "Varsity").trim();
+      return !lv || /^varsity$/i.test(lv) || /^starting$/i.test(lv);
+    }
+
+    function isVarsityMatch(m) {
+      if (!m) return true;
+      const lv = String(m.level || m.competitionLevel || "Varsity").trim();
+      if (!lv || /^varsity$/i.test(lv) || /^starting$/i.test(lv) || /^both$/i.test(lv)) return true;
+      if (recordBookIncludeExh && /^exh/i.test(lv)) return true;
+      return false;
+    }
+
     function recordBookSeasonLabel(season) {
       if (!season) return "";
       const n = String(season.name || "").trim();
@@ -13139,15 +13365,19 @@ function computeRawStatsBundle(wrestlerId) {
       return String(name || "").trim().toLowerCase().replace(/\s+/g, " ");
     }
 
-    /** Per-wrestler stats for a single season object (not limited by active bout filter). */
+    /** Per-wrestler Varsity stats for a single season object (all bouts). */
     function computeRecordBookAthleteStats(season, wrestlerId) {
       if (!season || !wrestlerId) {
         return { wins: 0, losses: 0, ties: 0, td: 0, nf: 0, rev: 0, esc: 0, pins: 0, tech: 0 };
       }
       const wrestler = (season.roster || []).find(w => w.id === wrestlerId);
-      const matches = (season.matches || []).filter(m => m.wrestlerId === wrestlerId);
+      if (!isVarsityWrestler(wrestler)) {
+        return { wins: 0, losses: 0, ties: 0, td: 0, nf: 0, rev: 0, esc: 0, pins: 0, tech: 0 };
+      }
+      const matches = (season.matches || []).filter(m => m.wrestlerId === wrestlerId && isVarsityMatch(m));
       const events = (season.events || []).filter(e => e.wrestlerId === wrestlerId);
       let wins = 0, losses = 0, ties = 0, pins = 0, tech = 0;
+      const matchIds = new Set(matches.map(m => m.id));
       matches.forEach(m => {
         const evs = events.filter(e => e.matchId === m.id);
         const r = classifyMatchResult(evs);
@@ -13161,144 +13391,225 @@ function computeRawStatsBundle(wrestlerId) {
         else if (r.result === "tie") ties++;
       });
       const countMove = (cat, dir, outcome) => events.filter(e => {
+        if (!matchIds.has(e.matchId)) return false;
         if (e.category !== cat) return false;
         if (dir && e.direction !== dir) return false;
         if (outcome && e.outcome !== outcome) return false;
         return true;
       }).length;
-      const nfNames = ["2-Point NF", "Near Fall 2", "NF2", "3-Point NF", "Near Fall 3", "NF3", "4-Point NF", "Near Fall 4", "NF4", "5-Point NF", "Near Fall 5", "NF5"];
       const td = countMove("Takedown", "offense", "success");
       const nf = events.filter(e =>
+        matchIds.has(e.matchId) &&
         e.category === "Near Fall / Pin" && e.direction === "offense" && e.outcome === "success" &&
-        nfNames.some(n => String(e.move || "").includes(n.replace("Near Fall ", "NF").slice(0, 3)) || nfNames.includes(e.move))
+        /nf|near\s*fall/i.test(String(e.move || e.detail || ""))
       ).length;
-      // Simpler NF count: any successful offense near fall / pin category that is not a pin win event
-      const nf2 = events.filter(e => e.category === "Near Fall / Pin" && e.direction === "offense" && e.outcome === "success" && /nf|near\s*fall/i.test(String(e.move || e.detail || ""))).length;
       const rev = countMove("Reversal", "offense", "success");
       const esc = countMove("Escape", "offense", "success");
-      return {
-        wins, losses, ties,
-        td,
-        nf: nf2,
-        rev, esc, pins, tech
-      };
+      return { wins, losses, ties, td, nf, rev, esc, pins, tech };
     }
 
-    function buildRecordBookData(scope) {
-      const isCareer = scope === "career";
-      const seasons = isCareer
-        ? ((store && store.seasons) || []).slice()
-        : [getActiveSeason()].filter(Boolean);
+    function recordBookCompareWl(a, b) {
+      if (b.wins !== a.wins) return b.wins - a.wins;
+      const ap = a.decided > 0 ? a.wins / a.decided : 0;
+      const bp = b.decided > 0 ? b.wins / b.decided : 0;
+      if (bp !== ap) return bp - ap;
+      if (a.losses !== b.losses) return a.losses - b.losses;
+      return String(a.name).localeCompare(String(b.name));
+    }
 
-      // key -> aggregate
-      const byKey = {};
+    function recordBookCompareVal(a, b) {
+      if ((b.value || 0) !== (a.value || 0)) return (b.value || 0) - (a.value || 0);
+      return String(a.name).localeCompare(String(b.name));
+    }
+
+    function mergeRecordList(list, entry, compareFn, limit) {
+      const lim = limit || 10;
+      const key = recordBookNormalizeName(entry.name) + "|" + String(entry.yearStr || entry.year || "");
+      const next = (list || []).filter(r => (recordBookNormalizeName(r.name) + "|" + String(r.yearStr || r.year || "")) !== key);
+      next.push(entry);
+      next.sort(compareFn);
+      return next.slice(0, lim);
+    }
+
+    /**
+     * Rebuild persistent Record Book from every season in the program.
+     * Single Season = best Varsity single-season marks (carry year to year).
+     * Career = career Varsity totals across seasons.
+     */
+    function refreshRecordBookFromAllSeasons() {
+      if (!recordBook || typeof recordBook !== "object") recordBook = { singleSeason: {}, career: {}, updatedAt: null };
+      const seasons = ((store && store.seasons) || []).slice();
+      const single = {};
+      const careerMap = {}; // nameKey|div -> agg
+
       seasons.forEach(season => {
         if (!season) return;
         const yearLabel = recordBookSeasonLabel(season);
         (season.roster || []).forEach(w => {
-          if (!w || !w.id) return;
-          const key = recordBookNormalizeName(w.name);
-          if (!key) return;
+          if (!isVarsityWrestler(w)) return;
           const st = computeRecordBookAthleteStats(season, w.id);
-          if (!byKey[key]) {
-            byKey[key] = {
-              name: w.name,
-              years: [],
-              weightClass: w.weightClass || "",
-              division: w.division || "Boys",
-              wins: 0, losses: 0, ties: 0,
-              td: 0, nf: 0, rev: 0, esc: 0, pins: 0, tech: 0,
-              weightYears: {}
+          const div = (w.division === "Girls") ? "Girls" : "Boys";
+          const name = w.name || "Unknown";
+          const nameKey = recordBookNormalizeName(name);
+          const wc = String(w.weightClass || "").trim() || "—";
+          const decided = st.wins + st.losses;
+          const recordStr = st.ties > 0 ? (st.wins + "-" + st.losses + "-" + st.ties) : (st.wins + "-" + st.losses);
+
+          // Career aggregate
+          const ck = nameKey + "|" + div;
+          if (!careerMap[ck]) {
+            careerMap[ck] = {
+              name, division: div, weightClass: wc,
+              years: [], wins: 0, losses: 0, ties: 0,
+              td: 0, nf: 0, rev: 0, esc: 0, pins: 0, tech: 0
             };
           }
-          const agg = byKey[key];
-          if (yearLabel && !agg.years.includes(yearLabel)) agg.years.push(yearLabel);
-          agg.wins += st.wins;
-          agg.losses += st.losses;
-          agg.ties += st.ties;
-          agg.td += st.td;
-          agg.nf += st.nf;
-          agg.rev += st.rev;
-          agg.esc += st.esc;
-          agg.pins += st.pins;
-          agg.tech += st.tech;
-          const wc = String(w.weightClass || "").trim() || "—";
-          if (!agg.weightYears[wc]) agg.weightYears[wc] = { wins: 0, losses: 0, ties: 0, years: [] };
-          agg.weightYears[wc].wins += st.wins;
-          agg.weightYears[wc].losses += st.losses;
-          agg.weightYears[wc].ties += st.ties;
-          if (yearLabel && !agg.weightYears[wc].years.includes(yearLabel)) agg.weightYears[wc].years.push(yearLabel);
-          // Prefer most recent / highest-match weight for display
-          if (w.weightClass) agg.weightClass = w.weightClass;
-        });
-      });
+          const c = careerMap[ck];
+          if (yearLabel && !c.years.includes(yearLabel)) c.years.push(yearLabel);
+          c.wins += st.wins; c.losses += st.losses; c.ties += st.ties;
+          c.td += st.td; c.nf += st.nf; c.rev += st.rev; c.esc += st.esc;
+          c.pins += st.pins; c.tech += st.tech;
+          if (w.weightClass) c.weightClass = w.weightClass;
 
-      const athletes = Object.keys(byKey).map(k => {
-        const a = byKey[k];
-        a.years.sort();
-        a.yearStr = a.years.length <= 2 ? a.years.join(", ") : (a.years[0] + "–" + a.years[a.years.length - 1]);
-        a.recordStr = a.ties > 0 ? (a.wins + "-" + a.losses + "-" + a.ties) : (a.wins + "-" + a.losses);
-        a.decided = a.wins + a.losses;
-        a.winPct = a.decided > 0 ? (a.wins / a.decided) : 0;
-        return a;
-      });
-
-      // Weight-class records: best W-L at each weight
-      const weightMap = {};
-      athletes.forEach(a => {
-        Object.keys(a.weightYears || {}).forEach(wc => {
-          const slot = a.weightYears[wc];
-          if (!weightMap[wc]) weightMap[wc] = [];
-          const decided = slot.wins + slot.losses;
-          weightMap[wc].push({
-            name: a.name,
-            years: (slot.years || []).slice().sort(),
-            yearStr: (slot.years || []).length <= 2 ? (slot.years || []).join(", ") : ((slot.years || [])[0] + "–" + (slot.years || []).slice(-1)[0]),
-            weightClass: wc,
-            wins: slot.wins,
-            losses: slot.losses,
-            ties: slot.ties,
-            recordStr: slot.ties > 0 ? (slot.wins + "-" + slot.losses + "-" + slot.ties) : (slot.wins + "-" + slot.losses),
-            decided,
-            winPct: decided > 0 ? slot.wins / decided : 0
+          // Single-season lists (this year only for this wrestler)
+          if (decided > 0 || st.wins > 0) {
+            const wlEntry = {
+              name, year: yearLabel, yearStr: yearLabel, division: div, weightClass: wc,
+              wins: st.wins, losses: st.losses, ties: st.ties, decided, recordStr, value: st.wins
+            };
+            const wk = "wt|" + div + "|" + wc;
+            single[wk] = mergeRecordList(single[wk], wlEntry, recordBookCompareWl, 10);
+          }
+          const stats = [
+            ["td", st.td], ["nf", st.nf], ["rev", st.rev], ["esc", st.esc], ["pins", st.pins], ["tech", st.tech]
+          ];
+          stats.forEach(([k, val]) => {
+            if (!val) return;
+            const entry = {
+              name, year: yearLabel, yearStr: yearLabel, division: div, weightClass: wc,
+              value: val, recordStr
+            };
+            const sk = "stat|" + div + "|" + k;
+            single[sk] = mergeRecordList(single[sk], entry, recordBookCompareVal, 10);
           });
         });
       });
-      const weightClasses = Object.keys(weightMap).sort((a, b) => (Number(a) || 0) - (Number(b) || 0) || String(a).localeCompare(String(b)));
-      const byWeight = {};
-      weightClasses.forEach(wc => {
-        byWeight[wc] = weightMap[wc]
-          .filter(x => x.decided > 0 || x.wins > 0)
-          .sort((a, b) => b.wins - a.wins || b.winPct - a.winPct || a.losses - b.losses || a.name.localeCompare(b.name));
+
+      // Career lists
+      const career = {};
+      Object.keys(careerMap).forEach(ck => {
+        const a = careerMap[ck];
+        a.years.sort();
+        a.yearStr = a.years.length <= 2 ? a.years.join(", ") : (a.years[0] + "–" + a.years[a.years.length - 1]);
+        a.decided = a.wins + a.losses;
+        a.recordStr = a.ties > 0 ? (a.wins + "-" + a.losses + "-" + a.ties) : (a.wins + "-" + a.losses);
+        a.value = a.wins;
+        const div = a.division;
+        const wc = String(a.weightClass || "—");
+        if (a.decided > 0 || a.wins > 0) {
+          const wk = "wt|" + div + "|" + wc;
+          career[wk] = mergeRecordList(career[wk], Object.assign({}, a), recordBookCompareWl, 10);
+        }
+        [["td", a.td], ["nf", a.nf], ["rev", a.rev], ["esc", a.esc], ["pins", a.pins], ["tech", a.tech]].forEach(([k, val]) => {
+          if (!val) return;
+          const sk = "stat|" + div + "|" + k;
+          career[sk] = mergeRecordList(career[sk], Object.assign({}, a, { value: val }), recordBookCompareVal, 10);
+        });
       });
 
-      function rankStat(getter) {
-        return athletes
-          .map(a => ({
-            name: a.name,
-            years: a.years,
-            yearStr: a.yearStr,
-            weightClass: a.weightClass,
-            value: getter(a),
-            recordStr: a.recordStr
-          }))
-          .filter(x => x.value > 0)
-          .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name));
+      // Preserve any prior entries not in current seasons (carry forward after season delete)
+      function unionLists(prevMap, nextMap, compareFn) {
+        const out = Object.assign({}, nextMap);
+        Object.keys(prevMap || {}).forEach(k => {
+          const prev = prevMap[k] || [];
+          prev.forEach(entry => {
+            out[k] = mergeRecordList(out[k], entry, compareFn, 10);
+          });
+        });
+        return out;
       }
+      recordBook.singleSeason = unionLists(recordBook.singleSeason, single, function (a, b) {
+        return (a.recordStr != null && b.recordStr != null && (a.wins != null)) ? recordBookCompareWl(a, b) : recordBookCompareVal(a, b);
+      });
+      // Re-sort each single list properly
+      Object.keys(recordBook.singleSeason).forEach(k => {
+        const list = recordBook.singleSeason[k] || [];
+        const cmp = k.indexOf("|wt|") >= 0 || k.indexOf("wt|") === 0 ? recordBookCompareWl : recordBookCompareVal;
+        // keys are wt|div|wc or stat|div|k
+        const isWt = k.indexOf("wt|") === 0;
+        list.sort(isWt ? recordBookCompareWl : recordBookCompareVal);
+        recordBook.singleSeason[k] = list.slice(0, 10);
+      });
+      recordBook.career = career;
+      Object.keys(recordBook.career).forEach(k => {
+        const isWt = k.indexOf("wt|") === 0;
+        (recordBook.career[k] || []).sort(isWt ? recordBookCompareWl : recordBookCompareVal);
+        recordBook.career[k] = (recordBook.career[k] || []).slice(0, 10);
+      });
+      persistRecordBook();
+    }
+
+    function filterRecordRows(rows, division) {
+      let list = rows || [];
+      if (division && division !== "All") {
+        list = list.filter(r => (r.division || "Boys") === division);
+      }
+      return list;
+    }
+
+    function buildRecordBookData(scope) {
+      try { refreshRecordBookFromAllSeasons(); } catch (e) { console.warn(e); }
+      const isCareer = scope === "career";
+      const map = isCareer ? (recordBook.career || {}) : (recordBook.singleSeason || {});
+      const div = recordBookDivision || "All";
+
+      // Weight classes present
+      const wcSet = {};
+      Object.keys(map).forEach(k => {
+        if (k.indexOf("wt|") !== 0) return;
+        const parts = k.split("|"); // wt, div, wc
+        if (parts.length < 3) return;
+        if (div !== "All" && parts[1] !== div) return;
+        wcSet[parts[2]] = true;
+      });
+      const weightClasses = Object.keys(wcSet).sort((a, b) => (Number(a) || 0) - (Number(b) || 0) || String(a).localeCompare(String(b)));
+      const byWeight = {};
+      weightClasses.forEach(wc => {
+        let rows = [];
+        if (div === "All") {
+          rows = [].concat(map["wt|Boys|" + wc] || [], map["wt|Girls|" + wc] || []);
+          rows.sort(recordBookCompareWl);
+        } else {
+          rows = (map["wt|" + div + "|" + wc] || []).slice();
+        }
+        byWeight[wc] = rows.slice(0, 10);
+      });
+
+      const catDefs = [
+        { key: "td", title: "Takedowns" },
+        { key: "nf", title: "Near Falls" },
+        { key: "rev", title: "Reversals" },
+        { key: "esc", title: "Escapes" },
+        { key: "pins", title: "Pins" },
+        { key: "tech", title: "Tech Falls" }
+      ];
+      const categories = catDefs.map(c => {
+        let rows = [];
+        if (div === "All") {
+          rows = [].concat(map["stat|Boys|" + c.key] || [], map["stat|Girls|" + c.key] || []);
+          rows.sort(recordBookCompareVal);
+        } else {
+          rows = (map["stat|" + div + "|" + c.key] || []).slice();
+        }
+        return { key: c.key, title: c.title, rows: rows.slice(0, 10) };
+      });
 
       return {
         scope: isCareer ? "career" : "season",
-        seasonLabel: isCareer ? "Career" : recordBookSeasonLabel(getActiveSeason()),
+        seasonLabel: isCareer ? "Career (Varsity)" : "Best single seasons (Varsity, all years)",
         byWeight,
         weightClasses,
-        categories: [
-          { key: "td", title: "Takedowns", rows: rankStat(a => a.td) },
-          { key: "nf", title: "Near Falls", rows: rankStat(a => a.nf) },
-          { key: "rev", title: "Reversals", rows: rankStat(a => a.rev) },
-          { key: "esc", title: "Escapes", rows: rankStat(a => a.esc) },
-          { key: "pins", title: "Pins", rows: rankStat(a => a.pins) },
-          { key: "tech", title: "Tech Falls", rows: rankStat(a => a.tech) }
-        ]
+        categories
       };
     }
 
@@ -13315,7 +13626,7 @@ function computeRawStatsBundle(wrestlerId) {
       if (!list.length) {
         return `<div style="margin-bottom:14px;">
           <div class="sec-label" style="margin-bottom:6px;">${swEsc(title)}</div>
-          <p style="font-size:12px; color:var(--muted); margin:0;">No data yet.</p>
+          <p style="font-size:12px; color:var(--muted); margin:0;">No Varsity records yet.</p>
         </div>`;
       }
       return `<div style="margin-bottom:14px;">
@@ -13331,7 +13642,7 @@ function computeRawStatsBundle(wrestlerId) {
                 <span style="font-weight:900; color:var(--gold); width:22px;">${idx + 1}.</span>
                 <div style="min-width:0;">
                   <div style="font-weight:800; color:var(--chalk);">${swEsc(r.name)}</div>
-                  <div style="font-size:11px; color:var(--muted);">${swEsc(r.yearStr || "")}${r.weightClass ? " · " + swEsc(r.weightClass) + " lbs" : ""}</div>
+                  <div style="font-size:11px; color:var(--muted);">${swEsc(r.yearStr || r.year || "")}${r.weightClass ? " · " + swEsc(r.weightClass) + " lbs" : ""}${r.division ? " · " + swEsc((typeof divisionDisplayName === "function" ? divisionDisplayName(r.division) : r.division)) : ""}</div>
                 </div>
               </div>
               <div style="font-weight:900; color:var(--gold); white-space:nowrap;">${swEsc(valueLabel ? valueLabel(r) : r.value)}</div>
@@ -13345,16 +13656,11 @@ function computeRawStatsBundle(wrestlerId) {
       const data = buildRecordBookData(recordBookScope);
       let weightHtml = "";
       if (!(data.weightClasses || []).length) {
-        weightHtml = `<p style="font-size:12px; color:var(--muted);">No weight-class records yet. Commit matches to build the book.</p>`;
+        weightHtml = `<p style="font-size:12px; color:var(--muted);">No weight-class records yet. Commit Varsity matches to build the book.</p>`;
       } else {
         weightHtml = data.weightClasses.map(wc => {
           const rows = data.byWeight[wc] || [];
-          return renderRecordBookSection(
-            wc + " lbs — Win/Loss",
-            "wt-" + wc,
-            rows,
-            r => r.recordStr
-          );
+          return renderRecordBookSection(wc + " lbs — Win/Loss", "wt-" + wc, rows, r => r.recordStr);
         }).join("");
       }
       const catHtml = (data.categories || []).map(c =>
@@ -13363,6 +13669,7 @@ function computeRawStatsBundle(wrestlerId) {
       return `
         <div style="margin-bottom:8px; font-size:12px; color:var(--muted);">
           Viewing: <strong style="color:var(--gold);">${swEsc(data.seasonLabel)}</strong>
+          · Varsity / starters only
         </div>
         <div class="sec-label" style="margin:12px 0 8px;">Weight Class Records</div>
         ${weightHtml}
@@ -13375,20 +13682,22 @@ function computeRawStatsBundle(wrestlerId) {
       const data = buildRecordBookData(recordBookScope);
       const team = (branding && branding.teamName) ? branding.teamName : "Strategic Wrestler";
       const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const scopeTitle = data.scope === "career" ? "Career Record Book" : ("Record Book — " + data.seasonLabel);
+      const scopeTitle = data.scope === "career" ? "Career Record Book (Varsity)" : "Single-Season Record Book (Varsity)";
+      const divLabel = recordBookDivision === "All" ? "All divisions" : (typeof divisionDisplayName === "function" ? divisionDisplayName(recordBookDivision) : recordBookDivision);
 
       function sectionTable(title, rows, valHeader, valFn) {
         const list = (rows || []).slice(0, 10);
         if (!list.length) return `<h3>${esc(title)}</h3><p style="color:#666;font-size:12px;">No data.</p>`;
         return `<h3>${esc(title)}</h3>
           <table>
-            <thead><tr><th>#</th><th>Name</th><th>Year(s)</th><th>Weight</th><th>${esc(valHeader)}</th></tr></thead>
+            <thead><tr><th>#</th><th>Name</th><th>Year(s)</th><th>Weight</th><th>Division</th><th>${esc(valHeader)}</th></tr></thead>
             <tbody>
               ${list.map((r, i) => `<tr>
                 <td>${i + 1}</td>
                 <td>${esc(r.name)}</td>
-                <td>${esc(r.yearStr || "")}</td>
+                <td>${esc(r.yearStr || r.year || "")}</td>
                 <td>${esc(r.weightClass || "")}</td>
+                <td>${esc(r.division || "")}</td>
                 <td>${esc(valFn(r))}</td>
               </tr>`).join("")}
             </tbody>
@@ -13416,7 +13725,7 @@ function computeRawStatsBundle(wrestlerId) {
   @media print { body { margin:12px; } }
 </style></head><body>
   <h1>${esc(team)}</h1>
-  <h2>${esc(scopeTitle)}</h2>
+  <h2>${esc(scopeTitle)} · ${esc(divLabel)}</h2>
   <div class="meta">Printed ${new Date().toLocaleDateString()} · Top 10 per category</div>
   ${body}
   <script>window.onload=function(){window.print();};<\/script>
@@ -14698,7 +15007,7 @@ function computeRawStatsBundle(wrestlerId) {
                 onchange="addCalendarMonth(this.value); this.style.display='none';" />
             </span>
             <label style="display:inline-flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk); cursor:pointer; margin:0;">
-              <input type="checkbox" ${(appConfig.printScheduleHolidays !== false) ? "checked" : ""} onchange="appConfig.printScheduleHolidays = this.checked; persist();" />
+              <input type="checkbox" ${(appConfig.printScheduleHolidays === true) ? "checked" : ""} onchange="appConfig.printScheduleHolidays = this.checked; persist();" />
               Holidays on printed schedule
             </label>
             <select class="select" style="width:auto; margin:0; font-size:11px;" onchange="boutDivisionFilter = this.value; render();">
@@ -14743,7 +15052,7 @@ function computeRawStatsBundle(wrestlerId) {
       const monthNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
       const team = (branding && branding.teamName) || "Team";
       const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const includeHolidays = (appConfig && appConfig.printScheduleHolidays !== false);
+      const includeHolidays = (appConfig && appConfig.printScheduleHolidays === true);
 
       function monthTableHtml(ym) {
         const parts = ym.split("-").map(Number);
@@ -19012,19 +19321,23 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         layoutOrder, adminSectionHidden, ourWrestlerAppearance, moveStyleTags,
         modifierStyleTags: (typeof modifierStyleTags !== "undefined") ? modifierStyleTags : undefined,
         aiTrainingPlanCache: (typeof aiTrainingPlanCache !== "undefined" && aiTrainingPlanCache) ? aiTrainingPlanCache : {},
+        recordBook: (typeof recordBook !== "undefined" && recordBook) ? recordBook : null,
         recordBookSnapshot: (typeof buildRecordBookData === "function") ? { season: buildRecordBookData("season"), career: buildRecordBookData("career") } : null,
         // Explicit aliases for clarity (same data lives in store for seasons/roster/matches/events/calendar)
         note: "store includes seasons (roster, bouts/events, matches, scoring events, attendance/calendar). Also: taxonomy, weights, branding, theme, appConfig, awards, gear, opponent memory, AI training library + plan cache."
       };
     }
 
-    function applyFullBackupPayload(payload) {
+    function applyFullBackupPayload(payload, opts) {
+      opts = opts || {};
       try { persistNow(); SWDB.snapshot("Before restoring a backup file", true); } catch (e) {}
       const result = validateFullBackupPayload(payload);
       if (!result.valid) {
         throw new Error(result.errors.slice(0, 3).join(" | ") || "Invalid backup");
       }
-      if (!confirm("Replace ALL local Strategic Wrestler data with this backup?\n\nExport a backup first if you are unsure.")) return false;
+      if (!opts.silent) {
+        if (!confirm("Replace ALL local Strategic Wrestler data with this backup?\n\nExport a backup first if you are unsure.")) return false;
+      }
       if (payload.store) store = payload.store;
       if (payload.taxonomy) taxonomy = payload.taxonomy;
       if (payload.weightClasses) weightClasses = payload.weightClasses;
@@ -19037,6 +19350,10 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         if (!appConfig.googleClientId && keepClient) appConfig.googleClientId = keepClient;
       }
       if (payload.awards) awards = payload.awards;
+      if (payload.recordBook && typeof payload.recordBook === "object") {
+        recordBook = payload.recordBook;
+        try { persistRecordBook(); } catch (e) {}
+      }
       if (payload.gearInventory) gearInventory = payload.gearInventory;
       if (payload.aiTrainingPlanCache && typeof payload.aiTrainingPlanCache === "object") {
         try { aiTrainingPlanCache = payload.aiTrainingPlanCache; } catch (e) {}
@@ -20996,6 +21313,26 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-18-idle-autosave",
+        items: [
+          "Record Book: optional Include Exh checkbox (Varsity/starters still required; exhibition matches count when on)",
+          "Auto-save runs once after 30 minutes of no user activity (not on a 15-minute active timer)",
+          "Printed schedule holidays default off; when on, only holidays in Calendar month tabs (or bout/custom months)"
+        ]
+      },
+
+      {
+        build: "2026-10-18-record-book-persist",
+        items: [
+          "Record Book: Single Season = best Varsity single-season marks across all years (records carry forward); Career = Varsity career totals",
+          "Record Book: Boys / Girls / All filter; top 3 expand to top 10; persisted + included in top-bar Save",
+          "Auto-save every 15 min while you are the editor and actively using the tab; auto-load latest Drive/local backup on open",
+          "When editor seat switches to you, auto-load the most recent backup (connects Drive if needed)",
+          "Presence still heartbeats hourly while the tab is open; idle is tracked separately for auto-save (30 min no input)"
+        ]
+      },
+
       {
         build: "2026-10-17-record-book",
         items: [
