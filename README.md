@@ -13,13 +13,15 @@ Upload Match Video from Computer or Youtube
 
 Manually Score Match
 
-AI Analyze Match (INW)
+AI Analyze Match (not yet implemented)
 
-Import Live Scoring from a Companion App - MatSide
+Import Live Scoring from a Companion App - MatScorer
 
 Custom Stats
 
 Develop AI Training Plans
+
+Create Highlight Reels
 
 Create and Assign Awards
 
