@@ -499,6 +499,7 @@
       <button class="tab-btn" onclick="switchTab('stats')">Stats</button>
       <button class="tab-btn" onclick="switchTab('plan')">Training Plan</button>
       <button class="tab-btn" onclick="switchTab('calendar')">Calendar</button>
+      <button class="tab-btn" onclick="switchTab('highlights')">Highlights</button>
       <button class="tab-btn" onclick="switchTab('admin')">Admin</button>
     </div>
 
@@ -2300,6 +2301,13 @@
     let expandedDefStatMove = null;
     let statsShowTeam = false;
     let statsViewMode = "efficiency"; // efficiency | raw
+    let highlightClipsStore = [];
+    let highlightReelsStore = [];
+    let highlightClipDraft = null;
+    let highlightReelDraft = null;
+    let highlightsSelectedWrestlerId = null;
+    let highlightsActiveReelId = null;
+    let highlightsPlayerUrl = null;
     let statsStandingDivision = "All";
     let statsStandingLevel = "All";
     let statsIncludeJvWins = null; // null = follow appConfig/auto
@@ -4320,7 +4328,7 @@
             if (!iAmEditor && (currentTab === "scout" || currentTab === "admin")) {
               currentTab = "roster";
               document.querySelectorAll(".tab-btn").forEach(function (btn, idx) {
-                btn.classList.toggle("active", ["roster", "scout", "sheet", "stats", "plan", "calendar", "admin"][idx] === "roster");
+                btn.classList.toggle("active", ["roster", "scout", "sheet", "stats", "plan", "calendar", "highlights", "admin"][idx] === "roster");
               });
             }
             if (typeof render === "function") render();
@@ -4686,6 +4694,14 @@
     try {
       setTimeout(function () {
         try { syncTrialWithSupabase().then(function () { try { if (typeof updateLicenseBadge === "function") updateLicenseBadge(); } catch (e) {} }).catch(function () {}); } catch (e) {}
+        try {
+          const hl = localStorage.getItem("sw-highlight-clips");
+          if (hl) highlightClipsStore = JSON.parse(hl) || [];
+        } catch (e) { highlightClipsStore = []; }
+        try {
+          const hr = localStorage.getItem("sw-highlight-reels");
+          if (hr) highlightReelsStore = JSON.parse(hr) || [];
+        } catch (e) { highlightReelsStore = []; }
         try { tryAutoConnectGoogleDrive(); } catch (e) {}
         // If still not signed in after silent attempt, show in-app connect card
         setTimeout(function () {
@@ -5221,12 +5237,16 @@
 
     /** Title row: "Score Match:" / "AI Video Scout:" + athlete + weight on one line */
     function renderScoutTitleRow(label, activeW, extraRightHtml) {
+      const hlBtn = (label && String(label).indexOf("Score Match") >= 0)
+        ? `<button type="button" class="btn btn-gold" style="padding:4px 10px; font-size:10px; width:auto;" onclick="openHighlightClipModal()" title="Mark a highlight clip at the current video time">Clip Highlight</button>`
+        : "";
       return `
         <div class="card-title" style="display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:8px;">
           <span style="white-space:nowrap;">${swEsc(label)}</span>
           <span style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
             ${renderScoutAthleteSelectHtml()}
             ${renderScoutWeightSelectHtml(activeW, true)}
+            ${hlBtn}
           </span>
           <span style="margin-left:auto; display:flex; align-items:center;">${extraRightHtml || ""}</span>
         </div>`;
@@ -5579,7 +5599,7 @@
       }
       currentTab = tab;
       document.querySelectorAll(".tab-btn").forEach((btn, idx) => {
-        btn.classList.toggle("active", ["roster", "scout", "sheet", "stats", "plan", "calendar", "admin"][idx] === tab);
+        btn.classList.toggle("active", ["roster", "scout", "sheet", "stats", "plan", "calendar", "highlights", "admin"][idx] === tab);
       });
       render();
       if (tab === "admin") {
@@ -5748,7 +5768,151 @@
       return mm + ":" + String(whole).padStart(2, "0") + "." + tenths;
     }
 
-    function pauseVideoAndGetTime() {
+    
+    function getVideoTimeSeconds() {
+      try {
+        if (typeof getCurrentVideoTimeSec === "function") {
+          const t = getCurrentVideoTimeSec();
+          if (t != null && !isNaN(t)) return Number(t);
+        }
+      } catch (e) {}
+      try { if (ytPlayer && ytPlayer.getCurrentTime) return ytPlayer.getCurrentTime() || 0; } catch (e) {}
+      try { const v = document.querySelector("video"); if (v) return v.currentTime || 0; } catch (e) {}
+      return 0;
+    }
+    function formatSecAsTimestamp(sec) {
+      sec = Math.max(0, Number(sec) || 0);
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+    }
+    function parseTimestampToSec(str) {
+      str = String(str || "").trim();
+      const m = str.match(/^(\d+):(\d{1,2})(?:\.(\d+))?$/);
+      if (!m) { const n = Number(str); return isNaN(n) ? 0 : n; }
+      return parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + (m[3] ? Number("0." + m[3]) : 0);
+    }
+    function safeFolderSlug(s) {
+      return String(s || "unknown").replace(/[^\w\s\-]+/g, "").trim().replace(/\s+/g, "_").slice(0, 60) || "unknown";
+    }
+    async function ensureHighlightFolders() {
+      try {
+        if (typeof ensureDriveSubfolderPath === "function" && typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
+          await ensureDriveSubfolderPath(["Highlight Clips"]);
+          await ensureDriveSubfolderPath(["Highlight Reels"]);
+        }
+      } catch (e) { console.warn("highlight folders", e); }
+    }
+    function openHighlightClipModal() {
+      try {
+        if (ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo();
+      } catch (e) {}
+      try { const v = document.querySelector("video"); if (v) v.pause(); } catch (e) {}
+      const t = getVideoTimeSeconds();
+      const bout = typeof getActiveBout === "function" ? getActiveBout() : null;
+      const w = typeof getActiveWrestler === "function" ? getActiveWrestler() : null;
+      highlightClipDraft = {
+        startSec: Math.max(0, t - 3),
+        endSec: Math.max(t + 2, 0.5),
+        boutId: bout && bout.id ? bout.id : (store.activeBoutId || ""),
+        wrestlerId: w && w.id ? w.id : (store.activeWrestlerId || ""),
+        label: ""
+      };
+      activeModal = "highlight-clip";
+      try { renderModal(); } catch (e) { render(); }
+    }
+    async function saveHighlightClipFromModal() {
+      const d = highlightClipDraft;
+      if (!d) return;
+      const startSec = parseTimestampToSec((document.getElementById("hl-start") || {}).value || d.startSec);
+      const endSec = parseTimestampToSec((document.getElementById("hl-end") || {}).value || d.endSec);
+      if (!(endSec > startSec)) { toast("End time must be after start time.", "error"); return; }
+      const season = getActiveSeason();
+      const bout = (season.bouts || []).find(b => b.id === d.boutId) || (typeof getActiveBout === "function" ? getActiveBout() : null);
+      const wrestler = (season.roster || []).find(w => w.id === d.wrestlerId) || (typeof getActiveWrestler === "function" ? getActiveWrestler() : null);
+      const eventName = bout ? (bout.opponent || bout.name || bout.location || "Event") : "Event";
+      const wrestlerName = wrestler ? wrestler.name : "Wrestler";
+      const id = "hl_" + Date.now().toString(36);
+      const clip = {
+        id, boutId: d.boutId || "", wrestlerId: d.wrestlerId || "", eventName, wrestlerName,
+        startSec, endSec, durationSec: Math.round((endSec - startSec) * 10) / 10,
+        label: ((document.getElementById("hl-label") || {}).value || ""),
+        createdAt: new Date().toISOString(),
+        folderPath: "Highlight Clips/" + safeFolderSlug(eventName) + "/" + safeFolderSlug(wrestlerName)
+      };
+      highlightClipsStore.push(clip);
+      try { localStorage.setItem("sw-highlight-clips", JSON.stringify(highlightClipsStore)); } catch (e) {}
+      await ensureHighlightFolders();
+      highlightClipDraft = null;
+      closeModal();
+      toast("Highlight marked " + formatSecAsTimestamp(startSec) + "–" + formatSecAsTimestamp(endSec) + " → " + clip.folderPath, "success", 5000);
+    }
+    function openHighlightReelModal() {
+      highlightReelDraft = { boutId: "all", wrestlerId: "all", musicMode: "prompt", musicPrompt: "upbeat sports highlight energy", targetLengthSec: 60 };
+      activeModal = "highlight-reel";
+      try { renderModal(); } catch (e) { render(); }
+    }
+    async function submitHighlightReelFromModal() {
+      const boutId = ((document.getElementById("hr-bout") || {}).value) || "all";
+      const wrestlerId = ((document.getElementById("hr-wrestler") || {}).value) || "all";
+      const targetLengthSec = Math.max(15, Number((document.getElementById("hr-length") || {}).value) || 60);
+      const mode = ((document.getElementById("hr-music-mode") || {}).value) || "prompt";
+      const musicPrompt = ((document.getElementById("hr-music-prompt") || {}).value || "").trim();
+      let clips = (highlightClipsStore || []).slice();
+      if (boutId && boutId !== "all") clips = clips.filter(c => c.boutId === boutId);
+      if (wrestlerId && wrestlerId !== "all") clips = clips.filter(c => c.wrestlerId === wrestlerId);
+      if (!clips.length) { toast("No highlight clips match that filter. Mark clips on Scout first.", "info", 5000); return; }
+      const season = getActiveSeason();
+      const bout = (season.bouts || []).find(b => b.id === boutId);
+      const wrestler = (season.roster || []).find(w => w.id === wrestlerId);
+      const eventName = boutId === "all" ? "All_Events" : (bout ? (bout.opponent || bout.name || "Event") : "Event");
+      const wrestlerName = wrestlerId === "all" ? "All_Wrestlers" : (wrestler ? wrestler.name : "Wrestler");
+      const job = {
+        id: "reel_" + Date.now().toString(36), boutId, wrestlerId, eventName, wrestlerName,
+        targetLengthSec, musicMode: mode, musicPrompt, clipIds: clips.map(c => c.id), clips,
+        folderPath: "Highlight Reels/" + safeFolderSlug(eventName) + "/" + safeFolderSlug(wrestlerName),
+        status: "queued", createdAt: new Date().toISOString()
+      };
+      try { localStorage.setItem("sw-highlight-reel-last", JSON.stringify(job)); } catch (e) {}
+      try {
+        highlightReelsStore = highlightReelsStore || [];
+        highlightReelsStore.push(job);
+        localStorage.setItem("sw-highlight-reels", JSON.stringify(highlightReelsStore));
+      } catch (e) {}
+      await ensureHighlightFolders();
+      try {
+        if (currentTab === "highlights") {
+          highlightsSelectedWrestlerId = job.wrestlerId === "all" ? null : job.wrestlerId;
+          highlightsActiveReelId = job.id;
+        }
+      } catch (e) {}
+      let serverOk = false;
+      try {
+        const base = (typeof getClipServerUrl === "function" ? getClipServerUrl() : "http://localhost:5057") || "http://localhost:5057";
+        const res = await fetch(String(base).replace(/\/$/, "") + "/health", { method: "GET" });
+        if (res.ok) {
+          serverOk = true;
+          await fetch(String(base).replace(/\/$/, "") + "/highlight-reel", {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(job)
+          }).catch(function () {});
+        }
+      } catch (e) {}
+      const aiPrompt = "Create a wrestling highlight reel (~" + targetLengthSec + "s). Clips: " +
+        clips.map(c => c.wrestlerName + " @ " + c.eventName + " " + formatSecAsTimestamp(c.startSec) + "-" + formatSecAsTimestamp(c.endSec)).join("; ") +
+        ". Music: " + (mode === "prompt" ? (musicPrompt || "upbeat sports") : "use provided audio") + ". Save to " + job.folderPath + ".";
+      closeModal();
+      if (serverOk) toast("Highlight reel job sent → " + job.folderPath, "success", 5000);
+      else {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(aiPrompt);
+            toast("Job saved (" + clips.length + " clips). Server offline — AI prompt copied. Folder: " + job.folderPath, "info", 7000);
+          } else toast("Job saved (" + clips.length + " clips). Automatic render needs clip server. " + job.folderPath, "info", 6000);
+        } catch (e) { toast("Job saved (" + clips.length + " clips).", "info", 5000); }
+      }
+    }
+
+function pauseVideoAndGetTime() {
       if (videoSourceType === "youtube") {
         if (ytPlayer && ytPlayer.getCurrentTime) {
           try { ytPlayer.pauseVideo(); } catch (err) {}
@@ -5983,6 +6147,7 @@
       if (currentTab === "stats") renderStats(container);
       if (currentTab === "plan") renderPlan(container);
       if (currentTab === "calendar") renderCalendar(container);
+      if (currentTab === "highlights") renderHighlights(container);
       if (currentTab === "admin") renderAdmin(container);
       try { setTimeout(function(){ softCheckClipServer(); }, 200); } catch (e) {}
 
@@ -12063,6 +12228,46 @@ async function testClipServerConnection() {
       return { ourFirst, oppFirst, pct, contests };
     }
 
+
+    /** Average offensive scoring points by period (P1/P2/P3). Uses event.points on offense scores. */
+    function computeAvgPointsPerPeriod(targetWrestlerId = null) {
+      const season = getActiveSeason();
+      const matches = (season.matches || []).filter(m => {
+        if (targetWrestlerId && m.wrestlerId !== targetWrestlerId) return false;
+        if (store.activeBoutId !== "all" && m.boutId !== store.activeBoutId) return false;
+        return true;
+      });
+      const matchIds = new Set(matches.map(m => m.id));
+      const totals = { P1: 0, P2: 0, P3: 0 };
+      const n = matches.length;
+      (season.events || []).forEach(e => {
+        if (!e || (targetWrestlerId && e.wrestlerId !== targetWrestlerId)) return;
+        if (store.activeBoutId !== "all" && e.boutId !== store.activeBoutId) return;
+        if (e.matchId && matchIds.size && !matchIds.has(e.matchId)) return;
+        if (e.direction !== "offense") return;
+        const pts = Number(e.points);
+        if (!pts || isNaN(pts) || pts <= 0) return;
+        const cat = String(e.category || "");
+        if (cat === "Riding Time" || cat === "Flow" || cat === "Choice") return;
+        let p = String(e.period || "P1").toUpperCase().replace(/\s+/g, "");
+        if (p === "1" || p === "PERIOD1") p = "P1";
+        if (p === "2" || p === "PERIOD2") p = "P2";
+        if (p === "3" || p === "PERIOD3") p = "P3";
+        if (p === "OT" || p === "SV" || p.indexOf("TB") === 0) return;
+        if (totals[p] == null) return;
+        totals[p] += pts;
+      });
+      const avg = (period) => n ? Math.round((totals[period] / n) * 100) / 100 : 0;
+      return {
+        totals,
+        matchCount: n,
+        avgP1: avg("P1"),
+        avgP2: avg("P2"),
+        avgP3: avg("P3"),
+        totalPts: totals.P1 + totals.P2 + totals.P3
+      };
+    }
+
     /** Riding time from committed match events (seconds). */
     function computeRidingTimeStats(targetWrestlerId = null) {
       const season = getActiveSeason();
@@ -12603,11 +12808,20 @@ async function testClipServerConnection() {
         const rtAvgMatchLeaders = [];
         const rtAvgOppLeaders = [];
         const rtAvgNfPinLeaders = [];
+        const avgPtsP1Leaders = [];
+        const avgPtsP2Leaders = [];
+        const avgPtsP3Leaders = [];
         filteredAthletes.forEach(w => {
           const prof = computePositionalProficiency(w.id);
           if (prof.neutral.opps >= 2) neutralProfLeader.push({ ...w, val: prof.neutral.pct, displayVal: formatProfIndex(prof.neutral.pct) });
           if (prof.top.opps >= 2) topProfLeader.push({ ...w, val: prof.top.pct, displayVal: formatProfIndex(prof.top.pct) });
           if (prof.bottom.opps >= 2) bottomProfLeader.push({ ...w, val: prof.bottom.pct, displayVal: formatProfIndex(prof.bottom.pct) });
+          const pp = computeAvgPointsPerPeriod(w.id);
+          if (pp.matchCount > 0 && pp.totalPts > 0) {
+            if (pp.avgP1 > 0) avgPtsP1Leaders.push({ ...w, val: pp.avgP1, displayVal: String(pp.avgP1) });
+            if (pp.avgP2 > 0) avgPtsP2Leaders.push({ ...w, val: pp.avgP2, displayVal: String(pp.avgP2) });
+            if (pp.avgP3 > 0) avgPtsP3Leaders.push({ ...w, val: pp.avgP3, displayVal: String(pp.avgP3) });
+          }
           const rt = computeRidingTimeStats(w.id);
           if (rt.totalOurSec > 0) {
             rtTotalLeaders.push({ ...w, val: rt.totalOurSec, displayVal: rt.fmt(rt.totalOurSec) });
@@ -12629,6 +12843,9 @@ async function testClipServerConnection() {
           card("Neutral Proficiency", neutralProfLeader, "prof"),
           card("Top Proficiency", topProfLeader, "prof"),
           card("Bottom Proficiency", bottomProfLeader, "prof"),
+          card("Avg Pts / Period 1", avgPtsP1Leaders, null),
+          card("Avg Pts / Period 2", avgPtsP2Leaders, null),
+          card("Avg Pts / Period 3", avgPtsP3Leaders, null),
           card("Total Riding Time", rtTotalLeaders, null),
           card("Avg RT per Match", rtAvgMatchLeaders, null),
           card("Avg RT per Opportunity", rtAvgOppLeaders, null),
@@ -13086,6 +13303,9 @@ function computeRawStatsBundle(wrestlerId) {
       const rtStats = statsShowTeam
         ? computeRidingTimeStats(null)
         : computeRidingTimeStats(activeW ? activeW.id : null);
+      const periodPts = statsShowTeam
+        ? computeAvgPointsPerPeriod(null)
+        : computeAvgPointsPerPeriod(activeW ? activeW.id : null);
 
       const scopedMatches = statsShowTeam
         ? season.matches.filter(m => store.activeBoutId === "all" || m.boutId === store.activeBoutId).length
@@ -13338,6 +13558,27 @@ function computeRawStatsBundle(wrestlerId) {
                 <div class="sec-label">Avg / NF or Pin</div>
                 <div style="font-size:20px; font-weight:800; font-family:monospace; color:var(--chalk);">${rtStats.fmt(rtStats.avgOurPerNfOrPin || 0)}</div>
                 <div style="font-size:10px; color:var(--muted);">${swEsc(rtStats.nfOrPinCount || 0)} NF or Pin scored</div>
+              </div>
+            </div>
+
+            <div style="font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; margin:12px 0 8px;">
+              Avg Points per Period <span style="font-weight:400; text-transform:none;">(offensive scoring · ${swEsc(periodPts.matchCount)} match(es))</span>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; margin-bottom:12px;">
+              <div class="stat-box stat-box-center">
+                <div class="sec-label">Period 1</div>
+                <div style="font-size:20px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP1)}</div>
+                <div style="font-size:10px; color:var(--muted);">${swEsc(periodPts.totals.P1)} total pts</div>
+              </div>
+              <div class="stat-box stat-box-center">
+                <div class="sec-label">Period 2</div>
+                <div style="font-size:20px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP2)}</div>
+                <div style="font-size:10px; color:var(--muted);">${swEsc(periodPts.totals.P2)} total pts</div>
+              </div>
+              <div class="stat-box stat-box-center">
+                <div class="sec-label">Period 3</div>
+                <div style="font-size:20px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP3)}</div>
+                <div style="font-size:10px; color:var(--muted);">${swEsc(periodPts.totals.P3)} total pts</div>
               </div>
             </div>
 
@@ -15220,6 +15461,197 @@ function computeRawStatsBundle(wrestlerId) {
       calendarSelectedDate = dateStr;
       activeModal = "calendar-day";
       renderModal();
+    }
+
+
+    function persistHighlightStores() {
+      try { localStorage.setItem("sw-highlight-clips", JSON.stringify(highlightClipsStore || [])); } catch (e) {}
+      try { localStorage.setItem("sw-highlight-reels", JSON.stringify(highlightReelsStore || [])); } catch (e) {}
+    }
+
+    function getHighlightWrestlerStats() {
+      const season = getActiveSeason();
+      const byId = {};
+      (season.roster || []).forEach(w => {
+        byId[w.id] = { id: w.id, name: w.name, weightClass: w.weightClass, clips: 0, reels: 0 };
+      });
+      (highlightClipsStore || []).forEach(c => {
+        const id = c.wrestlerId || "_unknown";
+        if (!byId[id]) byId[id] = { id: id, name: c.wrestlerName || "Unknown", weightClass: "", clips: 0, reels: 0 };
+        byId[id].clips++;
+      });
+      (highlightReelsStore || []).forEach(r => {
+        if (r.wrestlerId && r.wrestlerId !== "all") {
+          const id = r.wrestlerId;
+          if (!byId[id]) byId[id] = { id: id, name: r.wrestlerName || "Unknown", weightClass: "", clips: 0, reels: 0 };
+          byId[id].reels++;
+        } else {
+          // multi-wrestler reel: count under special bucket
+          if (!byId["__all__"]) byId["__all__"] = { id: "__all__", name: "All / Multi-wrestler", weightClass: "", clips: 0, reels: 0 };
+          byId["__all__"].reels++;
+        }
+      });
+      return Object.values(byId)
+        .filter(x => x.clips > 0 || x.reels > 0 || (season.roster || []).some(w => w.id === x.id))
+        .sort((a, b) => (Number(a.weightClass) || 999) - (Number(b.weightClass) || 999) || String(a.name).localeCompare(String(b.name)));
+    }
+
+    function selectHighlightsWrestler(id) {
+      highlightsSelectedWrestlerId = id;
+      highlightsActiveReelId = null;
+      if (highlightsPlayerUrl) {
+        try { URL.revokeObjectURL(highlightsPlayerUrl); } catch (e) {}
+        highlightsPlayerUrl = null;
+      }
+      render();
+    }
+
+    function loadHighlightReelForWatch(reelId) {
+      const reel = (highlightReelsStore || []).find(r => r.id === reelId);
+      if (!reel) { toast("Reel not found.", "error"); return; }
+      highlightsActiveReelId = reelId;
+      if (highlightsPlayerUrl) {
+        try { URL.revokeObjectURL(highlightsPlayerUrl); } catch (e) {}
+        highlightsPlayerUrl = null;
+      }
+      if (reel.objectUrl) {
+        highlightsPlayerUrl = reel.objectUrl;
+      } else if (reel.fileDataUrl) {
+        highlightsPlayerUrl = reel.fileDataUrl;
+      }
+      render();
+      if (!highlightsPlayerUrl && !reel.localPath) {
+        toast("No video file attached yet. Use Load reel file, or finish render on the clip server.", "info", 5000);
+      }
+    }
+
+    function onHighlightReelFileChosen(input) {
+      const file = input && input.files && input.files[0];
+      if (!file) return;
+      if (highlightsPlayerUrl) {
+        try { URL.revokeObjectURL(highlightsPlayerUrl); } catch (e) {}
+      }
+      highlightsPlayerUrl = URL.createObjectURL(file);
+      // Attach to active reel if any
+      if (highlightsActiveReelId) {
+        const reel = (highlightReelsStore || []).find(r => r.id === highlightsActiveReelId);
+        if (reel) {
+          reel.fileName = file.name;
+          reel.status = "ready";
+          reel.objectUrl = highlightsPlayerUrl;
+          persistHighlightStores();
+        }
+      } else {
+        // Create a local-only reel entry for this file
+        const season = getActiveSeason();
+        const w = (season.roster || []).find(x => x.id === highlightsSelectedWrestlerId);
+        const reel = {
+          id: "reel_file_" + Date.now().toString(36),
+          wrestlerId: highlightsSelectedWrestlerId || "all",
+          wrestlerName: w ? w.name : "Loaded file",
+          eventName: "Imported",
+          fileName: file.name,
+          status: "ready",
+          objectUrl: highlightsPlayerUrl,
+          folderPath: "Highlight Reels/Imported",
+          createdAt: new Date().toISOString(),
+          clips: []
+        };
+        highlightReelsStore = highlightReelsStore || [];
+        highlightReelsStore.push(reel);
+        highlightsActiveReelId = reel.id;
+        persistHighlightStores();
+      }
+      render();
+      toast("Loaded " + file.name, "success", 3000);
+    }
+
+    function renderHighlights(target) {
+      if (!target) return;
+      const season = getActiveSeason();
+      const stats = getHighlightWrestlerStats();
+      const selId = highlightsSelectedWrestlerId;
+      const reelsForSel = (highlightReelsStore || []).filter(r => {
+        if (!selId) return true;
+        if (selId === "__all__") return !r.wrestlerId || r.wrestlerId === "all";
+        return r.wrestlerId === selId;
+      });
+      const clipsForSel = (highlightClipsStore || []).filter(c => !selId || c.wrestlerId === selId);
+      const activeReel = (highlightReelsStore || []).find(r => r.id === highlightsActiveReelId);
+
+      const listHtml = stats.length
+        ? stats.map(w => {
+            const active = selId === w.id;
+            return `<button type="button" class="btn" style="width:100%; text-align:left; padding:10px 12px; margin-bottom:6px; background:${active ? "var(--goldDim)" : "var(--mat)"}; border:1px solid ${active ? "var(--gold)" : "var(--panelLine)"}; color:var(--chalk);"
+              onclick="selectHighlightsWrestler('${swJs(w.id)}')">
+              <div style="font-weight:800; font-size:13px;">${swEsc(w.name)}${w.weightClass ? ` <span style="color:var(--muted); font-weight:600;">· ${swEsc(w.weightClass)}</span>` : ""}</div>
+              <div style="font-size:11px; color:var(--muted); margin-top:2px;">${swEsc(w.clips)} clip(s) · ${swEsc(w.reels)} reel(s)</div>
+            </button>`;
+          }).join("")
+        : `<p style="font-size:12px; color:var(--muted);">No athletes yet. Add a roster and mark clips on Scout.</p>`;
+
+      const reelListHtml = reelsForSel.length
+        ? reelsForSel.map(r => {
+            const active = highlightsActiveReelId === r.id;
+            const label = (r.eventName || "Reel") + (r.fileName ? " · " + r.fileName : "") + (r.status ? " [" + r.status + "]" : "");
+            return `<button type="button" class="btn" style="width:100%; text-align:left; padding:8px 10px; margin-bottom:4px; font-size:11px; background:${active ? "var(--gold)" : "var(--panelLine)"}; color:${active ? "var(--mat)" : "var(--chalk)"};"
+              onclick="loadHighlightReelForWatch('${swJs(r.id)}')">${swEsc(label)}</button>`;
+          }).join("")
+        : `<p style="font-size:11px; color:var(--muted);">No reels for this selection. Create one or load a file.</p>`;
+
+      const clipListHtml = clipsForSel.length
+        ? `<div style="font-size:11px; color:var(--muted); max-height:120px; overflow:auto;">` +
+          clipsForSel.slice().reverse().slice(0, 40).map(c =>
+            `<div style="padding:3px 0; border-bottom:1px solid var(--panelLine);">${swEsc(c.eventName || "")} · ${swEsc(formatSecAsTimestamp(c.startSec))}-${swEsc(formatSecAsTimestamp(c.endSec))}${c.label ? " · " + swEsc(c.label) : ""}</div>`
+          ).join("") + `</div>`
+        : `<p style="font-size:11px; color:var(--muted);">No marked clips${selId ? " for this wrestler" : ""}.</p>`;
+
+      const playerSrc = highlightsPlayerUrl || (activeReel && (activeReel.objectUrl || activeReel.fileDataUrl)) || "";
+
+      target.innerHTML = `
+        <div class="card">
+          <div class="card-title" style="display:flex; flex-wrap:wrap; align-items:center; gap:8px;">
+            <span>Highlights</span>
+            <span style="margin-left:auto; display:flex; gap:6px; flex-wrap:wrap;">
+              <button type="button" class="btn btn-gold" style="padding:4px 10px; font-size:10px; width:auto;" onclick="openHighlightReelModal()">Create Highlight Reel</button>
+              <label class="btn" style="padding:4px 10px; font-size:10px; width:auto; margin:0; cursor:pointer; background:var(--panelLine); color:var(--chalk);">
+                Load reel file
+                <input type="file" accept="video/*" style="display:none;" onchange="onHighlightReelFileChosen(this)" />
+              </label>
+            </span>
+          </div>
+          <p style="font-size:12px; color:var(--muted); margin:0 0 12px 0;">
+            Mark clips on Scout with <strong>Clip Highlight</strong>. Build reels here. Folders: Highlight Clips / Highlight Reels (Drive when connected).
+          </p>
+          <div style="display:grid; grid-template-columns:minmax(200px,280px) 1fr; gap:14px; align-items:start;">
+            <div>
+              <div class="sec-label" style="margin-bottom:8px;">Wrestlers</div>
+              <div style="max-height:520px; overflow:auto; padding-right:4px;">${listHtml}</div>
+            </div>
+            <div>
+              <div class="sec-label" style="margin-bottom:8px;">Viewer</div>
+              <div style="background:#000; border-radius:10px; border:1px solid var(--panelLine); min-height:220px; display:flex; align-items:center; justify-content:center; overflow:hidden;">
+                ${playerSrc
+                  ? `<video id="highlights-player" controls playsinline style="width:100%; max-height:420px; background:#000;" src="${swEsc(playerSrc)}"></video>`
+                  : `<div style="padding:24px; text-align:center; color:var(--muted); font-size:13px;">Select a reel or load a video file to watch</div>`}
+              </div>
+              <div style="margin-top:12px;">
+                <div class="sec-label" style="margin-bottom:6px;">Reels ${selId ? "for selection" : "(all)"}</div>
+                ${reelListHtml}
+              </div>
+              <div style="margin-top:12px;">
+                <div class="sec-label" style="margin-bottom:6px;">Marked clips ${selId ? "" : "(all)"}</div>
+                ${clipListHtml}
+              </div>
+            </div>
+          </div>
+        </div>
+        <style>
+          @media (max-width: 720px) {
+            .card > div[style*="grid-template-columns:minmax"] { grid-template-columns: 1fr !important; }
+          }
+        </style>
+      `;
     }
 
     function renderCalendar(target) {
@@ -17401,6 +17833,61 @@ const aiBody = `
         return;
       }
 
+      if (activeModal === "highlight-clip") {
+        const d = highlightClipDraft || { startSec: 0, endSec: 5, label: "" };
+        root.innerHTML = `
+          <div class="modal-overlay" onclick="if(event.target===this){highlightClipDraft=null;closeModal();}">
+            <div class="modal-box" style="max-width:420px;" onclick="event.stopPropagation()">
+              <div class="card-title">Highlight Clip</div>
+              <p style="font-size:12px; color:var(--muted); margin:0 0 10px 0;">Video paused. Adjust start/end times for this highlight. Saved under Highlight Clips / Event / Wrestler.</p>
+              <label style="font-size:11px; color:var(--muted);">Start (mm:ss)</label>
+              <input id="hl-start" class="input" value="${swEsc(formatSecAsTimestamp(d.startSec))}" />
+              <label style="font-size:11px; color:var(--muted);">End (mm:ss)</label>
+              <input id="hl-end" class="input" value="${swEsc(formatSecAsTimestamp(d.endSec))}" />
+              <label style="font-size:11px; color:var(--muted);">Label (optional)</label>
+              <input id="hl-label" class="input" placeholder="e.g. Double leg finish" value="${swEsc(d.label || '')}" />
+              <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
+                <button class="btn btn-green" style="flex:2;" onclick="saveHighlightClipFromModal()">Save Highlight</button>
+                <button class="btn" style="flex:1; background:var(--panelLine); color:var(--chalk);" onclick="highlightClipDraft=null; closeModal();">Cancel</button>
+              </div>
+            </div>
+          </div>`;
+        return;
+      }
+      if (activeModal === "highlight-reel") {
+        const season = getActiveSeason();
+        const bouts = season.bouts || [];
+        const roster = season.roster || [];
+        const boutOpts = `<option value="all">All events</option>` + bouts.map(b => `<option value="${swEsc(b.id)}">${swEsc(b.opponent || b.name || b.id)}</option>`).join("");
+        const wrestlerOpts = `<option value="all">All wrestlers</option>` + roster.map(w => `<option value="${swEsc(w.id)}">${swEsc(w.name)}</option>`).join("");
+        const nClips = (highlightClipsStore || []).length;
+        root.innerHTML = `
+          <div class="modal-overlay" onclick="if(event.target===this) closeModal()">
+            <div class="modal-box" style="max-width:480px;" onclick="event.stopPropagation()">
+              <div class="card-title">Create Highlight Reel</div>
+              <p style="font-size:12px; color:var(--muted); margin:0 0 10px 0;">${swEsc(nClips)} marked clip(s) available. Output folder: Highlight Reels / Event / Wrestler.</p>
+              <label style="font-size:11px; color:var(--muted);">Event</label>
+              <select id="hr-bout" class="select">${boutOpts}</select>
+              <label style="font-size:11px; color:var(--muted);">Wrestler</label>
+              <select id="hr-wrestler" class="select">${wrestlerOpts}</select>
+              <label style="font-size:11px; color:var(--muted);">Target length (seconds)</label>
+              <input id="hr-length" class="input" type="number" min="15" max="600" value="60" />
+              <label style="font-size:11px; color:var(--muted);">Music</label>
+              <select id="hr-music-mode" class="select" onchange="const p=document.getElementById('hr-music-prompt'); const f=document.getElementById('hr-audio-file'); if(this.value==='prompt'){if(p)p.style.display='block'; if(f)f.style.display='none';} else {if(p)p.style.display='none'; if(f)f.style.display='block';}">
+                <option value="prompt">Describe music (prompt)</option>
+                <option value="file">Load audio file</option>
+              </select>
+              <input id="hr-music-prompt" class="input" placeholder="e.g. upbeat sports energy, no vocals" value="upbeat sports highlight energy" />
+              <input id="hr-audio-file" type="file" accept="audio/*" class="input" style="display:none;" />
+              <p style="font-size:10px; color:var(--muted); margin:8px 0 0 0;">Automatic video assembly needs the local clip server (ffmpeg). Otherwise a job + AI prompt is saved/copied for external production.</p>
+              <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
+                <button class="btn btn-green" style="flex:2;" onclick="submitHighlightReelFromModal()">Create Highlight</button>
+                <button class="btn" style="flex:1; background:var(--panelLine); color:var(--chalk);" onclick="closeModal()">Cancel</button>
+              </div>
+            </div>
+          </div>`;
+        return;
+      }
       if (activeModal === "gdrive-connect-prompt") {
         root.innerHTML = `
           <div class="modal-overlay">
@@ -21659,6 +22146,23 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-23-highlights-page",
+        items: [
+          "Scout: Clip Highlight moved into Score Match title row after weight class",
+          "New Highlights page (after Calendar): Create Highlight Reel, viewer, wrestler clip/reel counts",
+          "Stats: Avg Points per Period moved below Riding Time"
+        ]
+      },
+
+      {
+        build: "2026-10-20-period-highlights",
+        items: [
+          "Efficiency: Avg Points per Period (P1–P3) block before Riding Time; Leaderboard Avg Pts / Period 1–3",
+          "Scout Clip Highlight + Roster Create Highlight reel job (folders Highlight Clips / Highlight Reels); full AI video render needs local clip server"
+        ]
+      },
+
       {
         build: "2026-10-18-supabase-trial",
         items: [
