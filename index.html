@@ -445,7 +445,8 @@
       align-items: center;
       justify-content: center;
       width: 100%;
-      margin-top: 0;
+      margin-top: 8px;
+      padding-top: 2px;
     }
 
   </style>
@@ -4636,18 +4637,15 @@
 
     /** Soft Google Drive connect on launch: reuse existing Google session without a consent wall when possible. */
     function tryAutoConnectGoogleDrive() {
+      // Do not request OAuth silently — browsers/servers block it.
+      // Connection is user-initiated via in-app Connect Google Drive prompt or G badge.
       try {
-        if (!googleClientId()) return;
         if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
           try { updateIoLocationBadges(); } catch (e) {}
-          return;
-        }
-        // Silent only — browsers block OAuth popups without a user click
-        requestGoogleAccessToken("").then(function () {
+          try { ensureHighlightFolders(); } catch (e) {}
+        } else {
           try { updateIoLocationBadges(); } catch (e) {}
-        }).catch(function () {
-          try { updateIoLocationBadges(); } catch (e3) {}
-        });
+        }
       } catch (e) {}
     }
 
@@ -4688,6 +4686,7 @@
       }
       try { updateIoLocationBadges(); } catch (e) {}
       try { await syncTrialWithSupabase(); } catch (e) {}
+      try { await ensureHighlightFolders(); } catch (e) {}
       offerLoadLatestBackupPrompt();
     }
 
@@ -5237,16 +5236,12 @@
 
     /** Title row: "Score Match:" / "AI Video Scout:" + athlete + weight on one line */
     function renderScoutTitleRow(label, activeW, extraRightHtml) {
-      const hlBtn = (label && String(label).indexOf("Score Match") >= 0)
-        ? `<button type="button" class="btn btn-gold" style="padding:4px 10px; font-size:10px; width:auto;" onclick="openHighlightClipModal()" title="Mark a highlight clip at the current video time">Clip Highlight</button>`
-        : "";
       return `
         <div class="card-title" style="display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:8px;">
           <span style="white-space:nowrap;">${swEsc(label)}</span>
           <span style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
             ${renderScoutAthleteSelectHtml()}
             ${renderScoutWeightSelectHtml(activeW, true)}
-            ${hlBtn}
           </span>
           <span style="margin-left:auto; display:flex; align-items:center;">${extraRightHtml || ""}</span>
         </div>`;
@@ -5795,12 +5790,46 @@
     function safeFolderSlug(s) {
       return String(s || "unknown").replace(/[^\w\s\-]+/g, "").trim().replace(/\s+/g, "_").slice(0, 60) || "unknown";
     }
+    /** Create nested folders under Strategic Wrestler root on the user's default Drive. */
+    async function ensureDriveSubfolderPath(parts) {
+      parts = (parts || []).filter(Boolean);
+      if (!parts.length) return null;
+      if (typeof isGoogleSignedIn !== "function" || !isGoogleSignedIn()) return null;
+      if (typeof findOrCreateGoogleDriveFolder !== "function") return null;
+      let parentId = (appConfig && appConfig.googleDriveFolderId) || null;
+      if (!parentId) {
+        try {
+          if (typeof ensureGoogleDriveFolderStructure === "function") {
+            await ensureGoogleDriveFolderStructure();
+            parentId = (appConfig && appConfig.googleDriveFolderId) || null;
+          }
+        } catch (e) {}
+      }
+      if (!parentId) return null;
+      let current = parentId;
+      for (let i = 0; i < parts.length; i++) {
+        const folder = await findOrCreateGoogleDriveFolder(parts[i], current);
+        if (!folder || !folder.id) return null;
+        current = folder.id;
+      }
+      return current;
+    }
+
     async function ensureHighlightFolders() {
       try {
-        if (typeof ensureDriveSubfolderPath === "function" && typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
+        // Drive (when G is connected / default)
+        if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
           await ensureDriveSubfolderPath(["Highlight Clips"]);
           await ensureDriveSubfolderPath(["Highlight Reels"]);
         }
+        // Local Strategic Wrestler root (when user set local folder)
+        try {
+          if (typeof localSwRootHandle !== "undefined" && localSwRootHandle) {
+            const clips = await localSwRootHandle.getDirectoryHandle("Highlight Clips", { create: true });
+            const reels = await localSwRootHandle.getDirectoryHandle("Highlight Reels", { create: true });
+            void clips; void reels;
+          }
+        } catch (eLoc) {}
       } catch (e) { console.warn("highlight folders", e); }
     }
     function openHighlightClipModal() {
@@ -6275,6 +6304,10 @@ function pauseVideoAndGetTime() {
       "stats_proficiency": "Positional Proficiency is a net index: (Successes - Failures) / Opportunities in Neutral, Top, and Bottom. Shot % is successful offensive shots ÷ total shots taken (Takedown → Shots subcategory). Proficiency colors: under −0.15 red, −0.15 to 0.25 gold, 0.25+ green. Shot % uses efficiency bands (≥60 green, 40–59 gold, <40 red).",
       "stats_efficiency": "Technique efficiency charts broken down by taxonomy category/sub-group for offensive execution and defensive resistance. Period changes and position choices are excluded. Click any move to inspect which ties led to success or failure.",
       "stats_leaderboard": "Team Leaderboard ranks the top 3 wrestlers across major scoring metrics. Ties for 1st, 2nd, or 3rd are formatted cleanly, noting if more than 3 wrestlers share a rank.",
+      "admin_license_trial": "The 90-day trial is stored in Supabase (device + Google email). After expiry, enter a license key. Run the trials table SQL once in Supabase if trial sync is not working.",
+      "admin_home_location": "Home Location auto-fills the Location field when you add a Home bout/event on the Roster schedule.",
+      "highlights_page": "Mark clips on Scout with Clip Highlight (next to playback speeds). Create Highlight Reel builds a job under Highlight Reels using your default Drive or local folder. Load a finished video to watch in the viewer. Counts show marked clips and reels per wrestler.",
+      "scout_clip_highlight": "Pauses the video and lets you set start/end times for a highlight. Saved under Highlight Clips / Event / Wrestler on Drive (if connected) or your local Strategic Wrestler folder.",
       "stats_halloffame": "Hall of Fame lists every award assignment across all seasons, grouped by year. Awards persist year to year so past recipients remain visible.",
       "plan_remediation": "Prescriptive drilling matrix. Surfaces yellow/red positional proficiency (index under 0.25) plus offensive and defensive move gaps below your configured conversion thresholds.",
       "admin_ui": "Screen Layout lets you unlock the app and drag cards into a different order on the Roster, Scout, Bout Sheet, Stats, and Training Plan pages, with a per-page reset if you want the defaults back. The color palette below it recolors the interface; performance bands (red / yellow / green) stay fixed so stat readings never change meaning.",
@@ -6285,7 +6318,7 @@ function pauseVideoAndGetTime() {
       "admin_weight_classes": "Load a preset for your state or level, or build the list by hand. These weights populate every weight dropdown in the app \u2014 Add Wrestler, Edit Athlete, and opponent entry. Boys and Girls lists are separate unless you turn on the option to use boys weight classes for girls.",
       "admin_modifiers": "Ties and setups are the hand position or entry that led into a move; finishes are how it ended; rides are top control positions. Tagging these during scoring is what makes root-cause analysis work \u2014 it is the difference between knowing a single leg failed and knowing it failed off a collar tie every time. Add whatever vocabulary your room actually uses.",
       "admin_custom_flags": "INJ, SUSP, QUIT, and RS always exist. Add your own for anything else you track \u2014 CAPTAIN, ACADEMIC, WEIGHT WATCH, whatever your program uses. A custom flag becomes a toggle on Edit Athlete and shows as a tag on the roster in its chosen color. Deleting a flag here removes it from every athlete it was applied to.",
-      "scout_riding_time": "Click Our RT or Opp RT to set who has control \u2014 the clock runs automatically while the video plays and the button lightly pulses. Click the same button again to pause without losing control; click the other wrestler's button to hand control over. Stop clears the controller entirely. +1 RT manually awards the riding-time point without touching the clock, for when you want the point but the running time doesn't matter.",
+      "scout_riding_time": "Click Our RT or Opp RT to set who has control \u2014 the clock runs automatically while the video plays and the button lightly pulses. Click the same button again to pause without losing control; click the other wrestler's button to hand control over. Stop clears the controller entirely. On college seasons the +1 RT button appears automatically to award the riding-time point without touching the clock.",
       "admin_taxonomy": "The move taxonomy is the list of techniques available on the scoring pad, grouped by category and subcategory. Add moves your team drills so scoring matches your language, and remove ones you never use to keep the pad uncluttered. Changes apply immediately to the Scout page.",
       "roster_edit_athlete": "Set weight class, minimum weight, grade, and competition level, plus contact info for the athlete and up to two parents or guardians. Status flags mark an athlete as injured (INJ), suspended (SUSP), quit (QUIT), or redshirt (RS) \u2014 flagged athletes stay on the roster and keep their history but are visually separated in lists and print-outs. Archiving removes an athlete from active views without deleting any of their match data.",
       "scout_log": "Every scored action in order, with a timestamp in tenths of a second. Click an entry to edit the move, direction, or modifiers if you mis-tagged something live. Undo steps back one action at a time, newest first. Timestamps are what drive AI clip extraction later, so nudging one to the exact moment of the shot pays off if you plan to use video analysis.",
@@ -7762,7 +7795,7 @@ function pauseVideoAndGetTime() {
           <div id="yt-player-target"></div>
         </div>
 
-        <div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:8px; margin-bottom:4px;">
+        <div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:8px; margin-bottom:4px; width:100%;">
           <span class="sec-label">Playback Speed</span>
           <div id="playback-speed-btns" style="display:flex; flex-wrap:wrap; gap:4px;">
             ${[0.25, 0.5, 0.75, 1, 1.25, 1.5, 2].map(r => `
@@ -7770,6 +7803,8 @@ function pauseVideoAndGetTime() {
                 onclick="setVideoPlaybackRate(${r})">${r === 1 ? '1×' : r + '×'}</button>
             `).join('')}
           </div>
+          <button type="button" class="btn btn-gold" id="clip-highlight-btn" style="padding:4px 10px; font-size:10px; width:auto; margin-left:auto;"
+            onclick="openHighlightClipModal()" title="Mark a highlight clip at the current video time">Clip Highlight</button>
         </div>
       `;
       return videoCardEl;
@@ -8369,15 +8404,12 @@ function pauseVideoAndGetTime() {
               <label style="display:inline-flex; align-items:center; gap:3px; font-size:9px; color:var(--muted); cursor:pointer; white-space:nowrap;" title="Auto-start RT on control changes">
                 <input type="checkbox" ${appConfig.semiAutonomousRidingTime ? "checked" : ""} onchange="appConfig.semiAutonomousRidingTime = this.checked; persist();" style="margin:0; transform:scale(0.9);" />Semi-auto
               </label>
-              <label style="display:inline-flex; align-items:center; gap:3px; font-size:9px; color:var(--muted); cursor:pointer; white-space:nowrap;" title="Show +1 RT point button">
-                <input type="checkbox" ${appConfig.enableRidingTimePointButton ? "checked" : ""} onchange="appConfig.enableRidingTimePointButton = this.checked; persist(); render();" style="margin:0; transform:scale(0.9);" />+1 RT btn
-              </label>
               <button id="rt-btn-our" class="${ridingTimeButtonClass('our')}"
                 onclick="toggleRidingTimeSide('our')" title="Toggle Our RT (play/pause). Auto-starts on control when Semi-Autonomous is on.">${ridingTimeButtonLabel('our')}</button>
               <button id="rt-btn-opp" class="${ridingTimeButtonClass('opp')}"
                 onclick="toggleRidingTimeSide('opp')" title="Toggle Opp RT (play/pause). Auto-starts on control when Semi-Autonomous is on.">${ridingTimeButtonLabel('opp')}</button>
               <button class="btn btn-gold" style="padding:4px 8px; font-size:10px; font-weight:800;" onclick="stopRidingTime()" title="Stop and clear RT controller" ${!ridingTimeController && !ridingTimeActive ? 'disabled' : ''}>Stop</button>
-              ${appConfig.enableRidingTimePointButton ? `<button id="rt-manual-btn" class="btn" style="padding:4px 8px; font-size:10px; font-weight:800; background:var(--goldDim); border:1px solid var(--gold); color:var(--gold);" onclick="awardRidingTimePoint()" title="Manually award +1 riding time point">+1 RT</button>` : ""}
+              ${(typeof isCollegeContext === "function" && isCollegeContext()) ? `<button id="rt-manual-btn" class="btn" style="padding:4px 8px; font-size:10px; font-weight:800; background:var(--goldDim); border:1px solid var(--gold); color:var(--gold);" onclick="awardRidingTimePoint()" title="Manually award +1 riding time point (college)">+1 RT</button>` : ""}
               ${(() => {
                 const tot = getLiveRidingTimeTotals();
                 return `<span id="rt-live-clock" style="font-size:12px; font-weight:800; font-family:monospace; letter-spacing:0.02em;">
@@ -12229,7 +12261,6 @@ async function testClipServerConnection() {
     }
 
 
-    /** Average offensive scoring points by period (P1/P2/P3). Uses event.points on offense scores. */
     function computeAvgPointsPerPeriod(targetWrestlerId = null) {
       const season = getActiveSeason();
       const matches = (season.matches || []).filter(m => {
@@ -12239,32 +12270,42 @@ async function testClipServerConnection() {
       });
       const matchIds = new Set(matches.map(m => m.id));
       const totals = { P1: 0, P2: 0, P3: 0 };
+      const against = { P1: 0, P2: 0, P3: 0 };
       const n = matches.length;
-      (season.events || []).forEach(e => {
-        if (!e || (targetWrestlerId && e.wrestlerId !== targetWrestlerId)) return;
-        if (store.activeBoutId !== "all" && e.boutId !== store.activeBoutId) return;
-        if (e.matchId && matchIds.size && !matchIds.has(e.matchId)) return;
-        if (e.direction !== "offense") return;
-        const pts = Number(e.points);
-        if (!pts || isNaN(pts) || pts <= 0) return;
-        const cat = String(e.category || "");
-        if (cat === "Riding Time" || cat === "Flow" || cat === "Choice") return;
+      function normPeriod(e) {
         let p = String(e.period || "P1").toUpperCase().replace(/\s+/g, "");
         if (p === "1" || p === "PERIOD1") p = "P1";
         if (p === "2" || p === "PERIOD2") p = "P2";
         if (p === "3" || p === "PERIOD3") p = "P3";
-        if (p === "OT" || p === "SV" || p.indexOf("TB") === 0) return;
-        if (totals[p] == null) return;
-        totals[p] += pts;
+        if (p === "OT" || p === "SV" || p.indexOf("TB") === 0) return null;
+        return (p === "P1" || p === "P2" || p === "P3") ? p : null;
+      }
+      (season.events || []).forEach(e => {
+        if (!e || (targetWrestlerId && e.wrestlerId !== targetWrestlerId)) return;
+        if (store.activeBoutId !== "all" && e.boutId !== store.activeBoutId) return;
+        if (e.matchId && matchIds.size && !matchIds.has(e.matchId)) return;
+        const pts = Number(e.points);
+        if (!pts || isNaN(pts) || pts <= 0) return;
+        const cat = String(e.category || "");
+        if (cat === "Riding Time" || cat === "Flow" || cat === "Choice") return;
+        const p = normPeriod(e);
+        if (!p) return;
+        if (e.direction === "offense") totals[p] += pts;
+        else if (e.direction === "defense") against[p] += pts;
       });
-      const avg = (period) => n ? Math.round((totals[period] / n) * 100) / 100 : 0;
+      const avg = (map, period) => n ? Math.round((map[period] / n) * 100) / 100 : 0;
       return {
         totals,
+        against,
         matchCount: n,
-        avgP1: avg("P1"),
-        avgP2: avg("P2"),
-        avgP3: avg("P3"),
-        totalPts: totals.P1 + totals.P2 + totals.P3
+        avgP1: avg(totals, "P1"),
+        avgP2: avg(totals, "P2"),
+        avgP3: avg(totals, "P3"),
+        avgAgainstP1: avg(against, "P1"),
+        avgAgainstP2: avg(against, "P2"),
+        avgAgainstP3: avg(against, "P3"),
+        totalPts: totals.P1 + totals.P2 + totals.P3,
+        totalAgainst: against.P1 + against.P2 + against.P3
       };
     }
 
@@ -12851,6 +12892,29 @@ async function testClipServerConnection() {
           card("Avg RT per Opportunity", rtAvgOppLeaders, null),
           card("Avg RT per NF or Pin", rtAvgNfPinLeaders, null)
         ].join("");
+      } else {
+        // Scored On: avg points against by period
+        const avgAgP1 = [], avgAgP2 = [], avgAgP3 = [];
+        filteredAthletes.forEach(w => {
+          const pp = computeAvgPointsPerPeriod(w.id);
+          if (pp.matchCount > 0 && (pp.totalAgainst || 0) > 0) {
+            if (pp.avgAgainstP1 > 0) avgAgP1.push({ ...w, val: pp.avgAgainstP1, displayVal: String(pp.avgAgainstP1) });
+            if (pp.avgAgainstP2 > 0) avgAgP2.push({ ...w, val: pp.avgAgainstP2, displayVal: String(pp.avgAgainstP2) });
+            if (pp.avgAgainstP3 > 0) avgAgP3.push({ ...w, val: pp.avgAgainstP3, displayVal: String(pp.avgAgainstP3) });
+          }
+        });
+        const cardAg = (title, list) => {
+          list.sort((a, b) => b.val - a.val);
+          return `<div style="margin-bottom:10px;">
+            <div class="sec-label" style="margin-bottom:4px;">${title}</div>
+            ${buildLeaderboardPodium(list.slice(0, 3), "var(--red)", null)}
+          </div>`;
+        };
+        col2Html = [
+          cardAg("Avg Pts Against / Period 1", avgAgP1),
+          cardAg("Avg Pts Against / Period 2", avgAgP2),
+          cardAg("Avg Pts Against / Period 3", avgAgP3)
+        ].join("");
       }
 
       return `
@@ -12865,7 +12929,7 @@ async function testClipServerConnection() {
         </div>
         <div class="grid-2" style="align-items:start;">
           <div style="display:flex; flex-direction:column; gap:8px;">${boxHtml}</div>
-          <div style="display:flex; flex-direction:column; gap:8px;">${isOff ? col2Html : ''}</div>
+          <div style="display:flex; flex-direction:column; gap:8px;">${col2Html}</div>
         </div>
       `;
     }
@@ -13090,8 +13154,18 @@ function computeRawStatsBundle(wrestlerId) {
         firstTdPct = ft.pct;
         firstTdContests = ft.contests || 0;
       } catch (e) {}
+      const periodPts = typeof computeAvgPointsPerPeriod === "function"
+        ? computeAvgPointsPerPeriod(wrestlerId || null)
+        : { avgP1: 0, avgP2: 0, avgP3: 0, avgAgainstP1: 0, avgAgainstP2: 0, avgAgainstP3: 0 };
+      const avgPtsP1 = periodPts.avgP1 || 0;
+      const avgPtsP2 = periodPts.avgP2 || 0;
+      const avgPtsP3 = periodPts.avgP3 || 0;
+      const avgPtsAgP1 = periodPts.avgAgainstP1 || 0;
+      const avgPtsAgP2 = periodPts.avgAgainstP2 || 0;
+      const avgPtsAgP3 = periodPts.avgAgainstP3 || 0;
       return { wins, losses, ties, winForfeit, lossForfeit, winOt, lossOt, winPct, shotSuccess, shotTaken, shotPct,
         td, tdAgainst, firstTd, firstTdAgainst, firstTdPct, firstTdContests,
+        avgPtsP1, avgPtsP2, avgPtsP3, avgPtsAgP1, avgPtsAgP2, avgPtsAgP3,
         nf2, nf3, nf4, nf5, nf2a, nf3a, nf4a, nf5a, rev, revA, esc, escA, rtPtsEarned, rtPtsAgainst, penAwarded, penGiven,
         winPin, lossPin, winTech, lossTech, winMajor, lossMajor, winDec, lossDec, teamPts, teamPtsAgainst,
         choiceTop, choiceBottom, choiceNeutral, choiceDefer, prof, profTop, profBottom, profNeutral,
@@ -13160,6 +13234,12 @@ function computeRawStatsBundle(wrestlerId) {
         line("Takedowns against", b.tdAgainst, "tdAgainst", false),
         line("1st Takedowns", b.firstTd || 0, "firstTd"),
         line("1st Takedown %", (b.firstTdPct == null ? "—" : (b.firstTdPct + "% (" + (b.firstTd || 0) + "/" + (b.firstTdContests || 0) + ")")), "firstTdPct"),
+        line("Avg Pts / Period 1", b.avgPtsP1 || 0, "avgPtsP1"),
+        line("Avg Pts / Period 2", b.avgPtsP2 || 0, "avgPtsP2"),
+        line("Avg Pts / Period 3", b.avgPtsP3 || 0, "avgPtsP3"),
+        line("Avg Pts Against / Period 1", b.avgPtsAgP1 || 0, "avgPtsAgP1", false),
+        line("Avg Pts Against / Period 2", b.avgPtsAgP2 || 0, "avgPtsAgP2", false),
+        line("Avg Pts Against / Period 3", b.avgPtsAgP3 || 0, "avgPtsAgP3", false),
         line("NF2", b.nf2, "nf2"),
         line("NF3", b.nf3, "nf3"),
         line("NF4", b.nf4, "nf4"),
@@ -13562,23 +13642,23 @@ function computeRawStatsBundle(wrestlerId) {
             </div>
 
             <div style="font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; margin:12px 0 8px;">
-              Avg Points per Period <span style="font-weight:400; text-transform:none;">(offensive scoring · ${swEsc(periodPts.matchCount)} match(es))</span>
+              Avg Points per Period <span style="font-weight:400; text-transform:none;">(scored / against · ${swEsc(periodPts.matchCount)} match(es))</span>
             </div>
             <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; margin-bottom:12px;">
               <div class="stat-box stat-box-center">
                 <div class="sec-label">Period 1</div>
-                <div style="font-size:20px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP1)}</div>
-                <div style="font-size:10px; color:var(--muted);">${swEsc(periodPts.totals.P1)} total pts</div>
+                <div style="font-size:18px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP1)} <span style="color:var(--muted); font-size:12px;">/</span> <span style="color:var(--red);">${swEsc(periodPts.avgAgainstP1 || 0)}</span></div>
+                <div style="font-size:10px; color:var(--muted);">For ${swEsc(periodPts.totals.P1)} · Against ${swEsc((periodPts.against && periodPts.against.P1) || 0)}</div>
               </div>
               <div class="stat-box stat-box-center">
                 <div class="sec-label">Period 2</div>
-                <div style="font-size:20px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP2)}</div>
-                <div style="font-size:10px; color:var(--muted);">${swEsc(periodPts.totals.P2)} total pts</div>
+                <div style="font-size:18px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP2)} <span style="color:var(--muted); font-size:12px;">/</span> <span style="color:var(--red);">${swEsc(periodPts.avgAgainstP2 || 0)}</span></div>
+                <div style="font-size:10px; color:var(--muted);">For ${swEsc(periodPts.totals.P2)} · Against ${swEsc((periodPts.against && periodPts.against.P2) || 0)}</div>
               </div>
               <div class="stat-box stat-box-center">
                 <div class="sec-label">Period 3</div>
-                <div style="font-size:20px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP3)}</div>
-                <div style="font-size:10px; color:var(--muted);">${swEsc(periodPts.totals.P3)} total pts</div>
+                <div style="font-size:18px; font-weight:800; font-family:monospace; color:var(--chalk);">${swEsc(periodPts.avgP3)} <span style="color:var(--muted); font-size:12px;">/</span> <span style="color:var(--red);">${swEsc(periodPts.avgAgainstP3 || 0)}</span></div>
+                <div style="font-size:10px; color:var(--muted);">For ${swEsc(periodPts.totals.P3)} · Against ${swEsc((periodPts.against && periodPts.against.P3) || 0)}</div>
               </div>
             </div>
 
@@ -13588,16 +13668,16 @@ function computeRawStatsBundle(wrestlerId) {
             </div>
             <div class="grid-3" style="margin-bottom:16px;">
               <div style="background:var(--mat); border:1px solid var(--panelLine); padding:8px; border-radius:4px; text-align:center;">
-                <div style="font-size:10px; font-weight:700; color:var(--chalk);">Chose Neutral</div>
-                <div style="font-size:18px; font-weight:800; font-family:monospace; color:var(--gold);">${swEsc(profStats.choices.neutral)}</div>
+                <div style="font-size:10px; font-weight:700; color:var(--gold);">Chose Neutral</div>
+                <div style="font-size:18px; font-weight:800; font-family:monospace; color:#fff;">${swEsc(profStats.choices.neutral)}</div>
               </div>
               <div style="background:var(--mat); border:1px solid var(--panelLine); padding:8px; border-radius:4px; text-align:center;">
-                <div style="font-size:10px; font-weight:700; color:var(--chalk);">Chose Top</div>
-                <div style="font-size:18px; font-weight:800; font-family:monospace; color:var(--gold);">${swEsc(profStats.choices.top)}</div>
+                <div style="font-size:10px; font-weight:700; color:var(--gold);">Chose Top</div>
+                <div style="font-size:18px; font-weight:800; font-family:monospace; color:#fff;">${swEsc(profStats.choices.top)}</div>
               </div>
               <div style="background:var(--mat); border:1px solid var(--panelLine); padding:8px; border-radius:4px; text-align:center;">
-                <div style="font-size:10px; font-weight:700; color:var(--chalk);">Chose Bottom</div>
-                <div style="font-size:18px; font-weight:800; font-family:monospace; color:var(--gold);">${swEsc(profStats.choices.bottom)}</div>
+                <div style="font-size:10px; font-weight:700; color:var(--gold);">Chose Bottom</div>
+                <div style="font-size:18px; font-weight:800; font-family:monospace; color:#fff;">${swEsc(profStats.choices.bottom)}</div>
               </div>
             </div>
 
@@ -15960,7 +16040,7 @@ function computeRawStatsBundle(wrestlerId) {
           <div>
             <label class="field-label">Home Location</label>
             <input class="input" value="${swEsc(branding.homeLocation || '')}" oninput="branding.homeLocation = this.value; persist();" placeholder="e.g. Main gym, Desert Ridge HS" />
-            <p style="font-size:10px; color:var(--muted); margin:4px 0 0 0;">Auto-fills the Location field when you add a <strong>Home</strong> bout/event.</p>
+            ${helpIcon('admin_home_location')}
           </div>
           <div>
             <label class="fld-label">Team Text Color</label>
@@ -16225,7 +16305,7 @@ const teamOpsBody = `
             <p style="font-size:12px; margin:0 0 8px 0;">Status: <strong>${typeof licenseStatusLabel === "function" ? licenseStatusLabel() : "—"}</strong></p>
             <button type="button" class="btn btn-gold" style="font-size:11px; margin-bottom:8px;" onclick="openLicenseModal()">Enter activation key</button>
             <p style="font-size:10px; color:var(--muted); margin:0 0 10px 0;">
-              90-day trial is stored in Supabase (device + Google email). After expiry, enter a license key. Run the trials table SQL once in Supabase (see diagnostics or docs).
+${helpIcon('admin_license_trial')}
               With Supabase configured, keys are checked online (seats + expiry) and bound to a Google email.
             </p>
             <div class="sec-label" style="margin-top:8px;">Supabase (licensing + presence)</div>
@@ -20457,6 +20537,13 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           applyDriveFolderToConfig(purpose, folder.id, folder.name || label);
           created.push(label);
         }
+        try {
+          if (typeof ensureDriveSubfolderPath === "function") {
+            await ensureDriveSubfolderPath(["Highlight Clips"]);
+            await ensureDriveSubfolderPath(["Highlight Reels"]);
+            created.push("Highlight Clips", "Highlight Reels");
+          }
+        } catch (eH) {}
         try { persist(); } catch (e) {}
         try { render(); } catch (e) {}
         toast(
@@ -20588,7 +20675,9 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       exports: "Exports",
       archives: "Season Archives",
       aiLibrary: "AI Library",
-      matside: "MatScorer"
+      matside: "MatScorer",
+      highlightClips: "Highlight Clips",
+      highlightReels: "Highlight Reels"
     });
     const LOCAL_SW_ROOT_NAME = SW_FOLDER_ROOT_NAME;
     const LOCAL_SW_SUBFOLDERS = SW_FOLDER_NAMES;
@@ -22146,6 +22235,15 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-24-ui-polish",
+        items: [
+          "Highlight Clips/Reels auto-created on Drive and local SW folder; no silent Google OAuth on start (in-app Connect only)",
+          "Clip Highlight beside playback speeds; +1 RT auto for college (checkbox removed)",
+          "Avg points for/against per period on Efficiency, Leaderboard Scored On, and raw Stats; position choice colors gold/white"
+        ]
+      },
+
       {
         build: "2026-10-23-highlights-page",
         items: [
