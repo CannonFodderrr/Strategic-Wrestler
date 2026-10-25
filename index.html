@@ -2165,6 +2165,16 @@
       /** Preferred Gemini model id (tried first) */
       preferredAiModel: "gemini-3.6-flash",
       downloadTarget: "drive", // local | drive — prefer Drive when connected
+      /** Coach emails — shared as Drive Editor on team folders */
+      coachShareEmails: "",
+      /** Wrestler Google emails — shared as Drive Viewer (load latest data); unlimited */
+      wrestlerShareEmails: "",
+      /** SHA-256 hex of coach PIN (empty = PIN not set yet) */
+      coachPinHash: "",
+      /** Optional: allow wrestlers on Highlights page + Editor only on highlight Drive folders */
+      wrestlerAllowHighlights: false,
+      googleDriveHighlightClipsFolderId: "",
+      googleDriveHighlightReelsFolderId: "",
       /** When true, top-bar Save keeps only the newest N backup JSON files (Drive + local). */
       pruneBackupsAfter5Days: true, // legacy key name; means "prune enabled"
       pruneBackupsKeepCount: 5,
@@ -4189,6 +4199,7 @@
     }
 
     function presenceEligible() {
+      if (typeof isWrestlerMode === "function" && isWrestlerMode()) return false;
       if (typeof supabaseConfigured !== "function" || !supabaseConfigured()) return false;
       const state = typeof ensureLicenseState === "function" ? ensureLicenseState() : null;
       if (!state || !state.activated || state.licenseSource !== "supabase") return false;
@@ -4598,7 +4609,98 @@
     }
 
     /** True when another coach holds the editor seat on this license. */
+    /** session role: "coach" (default) or "wrestler" */
+    let swUserRole = (function () {
+      try { return sessionStorage.getItem("sw-user-role") || localStorage.getItem("sw-user-role") || ""; } catch (e) { return ""; }
+    })();
+
+    function isWrestlerMode() {
+      return swUserRole === "wrestler";
+    }
+
+    function setUserRole(role) {
+      if (role === "wrestler") {
+        swUserRole = "wrestler";
+        try { sessionStorage.removeItem("sw-coach-unlocked"); } catch (e) {}
+      } else {
+        // Coach only if PIN unlocked this session, or no PIN configured yet
+        let unlocked = false;
+        try { unlocked = sessionStorage.getItem("sw-coach-unlocked") === "1"; } catch (e) {}
+        if (typeof coachPinIsSet === "function" && coachPinIsSet() && !unlocked) {
+          swUserRole = "wrestler";
+        } else {
+          swUserRole = "coach";
+          try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+        }
+      }
+      try {
+        sessionStorage.setItem("sw-user-role", swUserRole);
+        localStorage.setItem("sw-user-role", swUserRole);
+      } catch (e) {}
+      try { updateRoleChrome(); } catch (e) {}
+      try { render(); } catch (e) {}
+    }
+
+    function guardWrestlerWrite(actionLabel) {
+      if (!isWrestlerMode()) return false;
+      try {
+        toast(
+          "Wrestler mode: view and print only.\n\n" +
+          "Saving, Drive sync, and editing team data are disabled.\n" +
+          "Use Load to refresh the latest team file from your coach." +
+          (actionLabel ? ("\n\nBlocked: " + actionLabel) : ""),
+          "info",
+          5000
+        );
+      } catch (e) {}
+      return true;
+    }
+
+    function wrestlerAllowedTabs() {
+      const tabs = ["sheet", "stats", "plan", "calendar"];
+      if (appConfig && appConfig.wrestlerAllowHighlights) tabs.push("highlights");
+      return tabs;
+    }
+
+    function updateRoleChrome() {
+      const wrestler = isWrestlerMode();
+      document.querySelectorAll(".tab-btn").forEach(function (btn) {
+        const label = (btn.textContent || "").trim().toLowerCase();
+        const map = {
+          roster: "roster", scout: "scout", "bout sheet": "sheet", stats: "stats",
+          "training plan": "plan", calendar: "calendar", highlights: "highlights", admin: "admin"
+        };
+        const key = map[label];
+        if (!key) return;
+        if (wrestler) {
+          const allowed = wrestlerAllowedTabs().indexOf(key) >= 0;
+          btn.style.display = allowed ? "" : "none";
+        } else {
+          btn.style.display = "";
+        }
+      });
+      const syncBtn = document.querySelector('button[onclick="syncLocalFoldersToGoogleDrive()"]');
+      const saveBtn = document.querySelector('button[onclick="saveSharedSeasonData()"]');
+      if (syncBtn) syncBtn.style.display = wrestler ? "none" : "";
+      if (saveBtn) saveBtn.style.display = wrestler ? "none" : "";
+      let badge = document.getElementById("sw-role-badge");
+      if (wrestler) {
+        if (!badge) {
+          badge = document.createElement("div");
+          badge.id = "sw-role-badge";
+          badge.style.cssText = "font-size:10px;font-weight:800;color:var(--gold);text-align:center;padding:2px 0;";
+          const bar = document.querySelector(".header") || document.querySelector(".scope-bar");
+          if (bar && bar.parentNode) bar.parentNode.insertBefore(badge, bar.nextSibling);
+        }
+        badge.textContent = "Wrestler mode · view & print · Load to refresh";
+        badge.style.display = "";
+      } else if (badge) {
+        badge.style.display = "none";
+      }
+    }
+
     function isPresenceViewOnly() {
+      if (isWrestlerMode()) return true;
       if (typeof presenceEligible === "function" && !presenceEligible()) return false;
       return presenceIAmEditor === false;
     }
@@ -4650,6 +4752,138 @@
     }
 
     /** In-app prompt (not a browser popup) — user click starts OAuth so it is not blocked. */
+    
+    
+    function coachPinIsSet() {
+      return !!(appConfig && appConfig.coachPinHash && String(appConfig.coachPinHash).length > 10);
+    }
+
+    async function hashCoachPin(pin) {
+      const raw = String(pin || "");
+      if (!raw) return "";
+      try {
+        if (window.crypto && crypto.subtle) {
+          const data = new TextEncoder().encode("sw-coach-pin-v1:" + raw);
+          const buf = await crypto.subtle.digest("SHA-256", data);
+          return Array.from(new Uint8Array(buf)).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+        }
+      } catch (e) {}
+      // Fallback (rare): weak hash
+      let h = 0;
+      const s = "sw-coach-pin-v1:" + raw;
+      for (let i = 0; i < s.length; i++) h = ((h << 5) - h) + s.charCodeAt(i) | 0;
+      return "fb_" + String(h);
+    }
+
+    async function verifyCoachPin(pin) {
+      if (!coachPinIsSet()) return true;
+      const h = await hashCoachPin(pin);
+      return h && h === appConfig.coachPinHash;
+    }
+
+    async function setCoachPinInteractive() {
+      if (typeof isWrestlerMode === "function" && isWrestlerMode()) {
+        toast("Switch to coach mode first (coach PIN).", "error");
+        return;
+      }
+      const a = prompt("Create coach PIN (min 4 characters):");
+      if (a == null) return;
+      if (String(a).length < 4) { toast("PIN must be at least 4 characters.", "error"); return; }
+      const b = prompt("Confirm coach PIN:");
+      if (b == null) return;
+      if (String(a) !== String(b)) { toast("PINs do not match.", "error"); return; }
+      appConfig.coachPinHash = await hashCoachPin(a);
+      try { persist(); } catch (e) {}
+      toast("Coach PIN saved. Required to enter coach mode on any device.", "success", 5000);
+      try { render(); } catch (e) {}
+    }
+
+    async function changeCoachPinInteractive() {
+      if (!coachPinIsSet()) { await setCoachPinInteractive(); return; }
+      const cur = prompt("Enter current coach PIN:");
+      if (cur == null) return;
+      if (!(await verifyCoachPin(cur))) { toast("Incorrect PIN.", "error"); return; }
+      const a = prompt("New coach PIN (min 4 characters):");
+      if (a == null) return;
+      if (String(a).length < 4) { toast("PIN must be at least 4 characters.", "error"); return; }
+      const b = prompt("Confirm new coach PIN:");
+      if (b == null) return;
+      if (String(a) !== String(b)) { toast("PINs do not match.", "error"); return; }
+      appConfig.coachPinHash = await hashCoachPin(a);
+      try { persist(); } catch (e) {}
+      toast("Coach PIN updated.", "success");
+    }
+
+    async function resetCoachPinWithLicense() {
+      // Allow reset when license is activated (same team) — does not reveal old PIN
+      try {
+        const state = typeof ensureLicenseState === "function" ? ensureLicenseState() : null;
+        if (!state || !state.activated) {
+          toast("Activate your team license first, then you can reset the coach PIN.", "error", 6000);
+          return;
+        }
+      } catch (e) {
+        toast("Could not verify license for PIN reset.", "error");
+        return;
+      }
+      const ok = confirm("Reset coach PIN?\n\nAnyone with this team license on this device can set a new PIN. Continue?");
+      if (!ok) return;
+      appConfig.coachPinHash = "";
+      try { persist(); } catch (e) {}
+      await setCoachPinInteractive();
+    }
+
+    function enterWrestlerMode() {
+      setUserRole("wrestler");
+      try {
+        const allowed = wrestlerAllowedTabs();
+        if (allowed.indexOf(currentTab) < 0) switchTab(allowed[0] || "stats");
+      } catch (e) {}
+      toast("Wrestler mode: view, print, and Load. Connect your Google account to Load from team Drive (Viewer).", "success", 6000);
+    }
+
+    async function enterCoachModeWithPin() {
+      if (!coachPinIsSet()) {
+        const go = confirm("No coach PIN is set yet.\n\nSet a coach PIN now? Until a PIN is set, this device stays in coach mode for setup.");
+        if (go) await setCoachPinInteractive();
+        try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+        setUserRole("coach");
+        toast("Coach mode.", "success");
+        return;
+      }
+      const pin = prompt("Enter coach PIN:");
+      if (pin == null) return;
+      if (!(await verifyCoachPin(pin))) {
+        toast("Incorrect coach PIN. Staying in wrestler mode.", "error");
+        enterWrestlerMode();
+        return;
+      }
+      try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+      setUserRole("coach");
+      toast("Coach mode unlocked.", "success");
+    }
+
+    function offerRoleSelectOnStartup() {
+      try {
+        if (sessionStorage.getItem("sw-role-prompted") === "1") {
+          try { updateRoleChrome(); } catch (e) {}
+          return;
+        }
+        sessionStorage.setItem("sw-role-prompted", "1");
+        // If coach PIN is configured, default to wrestler until PIN unlock (unless already unlocked this session)
+        let unlocked = false;
+        try { unlocked = sessionStorage.getItem("sw-coach-unlocked") === "1"; } catch (e) {}
+        if (coachPinIsSet() && !unlocked) {
+          setUserRole("wrestler");
+          activeModal = "role-select";
+          try { renderModal(); } catch (e) { render(); }
+        } else {
+          if (!swUserRole) setUserRole("coach");
+          try { updateRoleChrome(); } catch (e) {}
+        }
+      } catch (e) {}
+    }
+
     function offerGoogleDriveConnectOnStartup() {
       try {
         if (!googleClientId()) return;
@@ -5571,6 +5805,13 @@
     }
 
     function switchTab(tab) {
+      if (typeof isWrestlerMode === "function" && isWrestlerMode()) {
+        const allowed = typeof wrestlerAllowedTabs === "function" ? wrestlerAllowedTabs() : ["stats", "calendar"];
+        if (allowed.indexOf(tab) < 0) {
+          try { toast("Wrestler mode cannot open that page.", "info", 3000); } catch (e) {}
+          return;
+        }
+      }
       if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly() && (tab === "scout" || tab === "admin")) {
         try { guardPresenceEdit(tab === "scout" ? "Scout" : "Admin"); } catch (e) {}
         return;
@@ -5597,6 +5838,7 @@
         btn.classList.toggle("active", ["roster", "scout", "sheet", "stats", "plan", "calendar", "highlights", "admin"][idx] === tab);
       });
       render();
+      try { updateRoleChrome(); } catch (e) {}
       if (tab === "admin") {
         try { setTimeout(function () { if (typeof updateClipServerStatusUI === "function") updateClipServerStatusUI(); }, 0); } catch (e) {}
       }
@@ -5819,8 +6061,11 @@
       try {
         // Drive (when G is connected / default)
         if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
-          await ensureDriveSubfolderPath(["Highlight Clips"]);
-          await ensureDriveSubfolderPath(["Highlight Reels"]);
+          const clipsId = await ensureDriveSubfolderPath(["Highlight Clips"]);
+          const reelsId = await ensureDriveSubfolderPath(["Highlight Reels"]);
+          if (clipsId) appConfig.googleDriveHighlightClipsFolderId = clipsId;
+          if (reelsId) appConfig.googleDriveHighlightReelsFolderId = reelsId;
+          try { persist(); } catch (e) {}
         }
         // Local Strategic Wrestler root (when user set local folder)
         try {
@@ -16353,6 +16598,48 @@ ${helpIcon('admin_license_trial')}
               <button type="button" class="btn btn-green" style="font-size:11px;" onclick="connectGoogleDrive()">Connect Google</button>
               <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="disconnectGoogleDrive()">Disconnect</button>
             </div>
+
+            <div style="margin:12px 0; padding:10px; background:var(--mat); border:1px solid var(--panelLine); border-radius:6px;">
+              <div class="sub-label" style="margin-bottom:6px;">Coach PIN ${typeof helpIcon === "function" ? helpIcon("admin_coach_pin") : ""}</div>
+              <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">
+                Required to enter <strong>coach mode</strong> (edit/save/Admin). Without the PIN, users stay in wrestler mode. Forgot PIN? Reset after team license is active on this device.
+              </p>
+              <p style="font-size:11px; margin:0 0 8px 0; color:${coachPinIsSet() ? "var(--green)" : "var(--gold)"};">
+                Status: ${coachPinIsSet() ? "PIN is set" : "No PIN yet — set one before sharing the app with wrestlers"}
+              </p>
+              <div style="display:flex; flex-wrap:wrap; gap:6px;">
+                <button type="button" class="btn btn-gold" style="font-size:11px;" onclick="setCoachPinInteractive()">${coachPinIsSet() ? "Change PIN…" : "Set coach PIN…"}</button>
+                <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="changeCoachPinInteractive()">Change with current PIN…</button>
+                <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="resetCoachPinWithLicense()">Reset via license…</button>
+                <button type="button" class="btn btn-green" style="font-size:11px;" onclick="enterCoachModeWithPin()">Unlock coach mode…</button>
+                <button type="button" class="btn" style="font-size:11px; background:var(--panelLine); color:var(--chalk);" onclick="enterWrestlerMode()">Switch to wrestler mode</button>
+              </div>
+            </div>
+
+            <div style="margin:12px 0; padding:10px; background:var(--mat); border:1px solid var(--panelLine); border-radius:6px;">
+              <div class="sub-label" style="margin-bottom:6px;">Share folders with coaches ${typeof helpIcon === "function" ? helpIcon("admin_coach_share") : ""}</div>
+              <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">
+                Each coach uses their own Google account. Shares team folders as <strong>Editor</strong> so they can Save/Load.
+              </p>
+              <textarea class="input" rows="3" style="width:100%; margin-bottom:8px; font-size:12px;" placeholder="coach1@gmail.com&#10;coach2@school.edu"
+                onchange="appConfig.coachShareEmails = this.value; persist();">${swEsc(appConfig.coachShareEmails || "")}</textarea>
+              <button type="button" class="btn btn-gold" style="font-size:11px;" onclick="shareTeamFoldersWithCoaches()">Share with coaches (Editor)</button>
+            </div>
+
+            <div style="margin:12px 0; padding:10px; background:var(--mat); border:1px solid var(--panelLine); border-radius:6px;">
+              <div class="sub-label" style="margin-bottom:6px;">Wrestler Google accounts ${typeof helpIcon === "function" ? helpIcon("admin_wrestler_access") : ""}</div>
+              <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">
+                Unlimited wrestlers. Enter each wrestler’s Gmail (one per line). Shares team data folders as <strong>Viewer</strong> (Load only). If Highlights is enabled, also grants <strong>Editor only</strong> on <em>Highlight Clips</em> and <em>Highlight Reels</em> — not Backups or other folders.
+              </p>
+              <textarea class="input" rows="4" style="width:100%; margin-bottom:8px; font-size:12px;" placeholder="wrestler1@gmail.com&#10;wrestler2@gmail.com"
+                onchange="appConfig.wrestlerShareEmails = this.value; persist();">${swEsc(appConfig.wrestlerShareEmails || "")}</textarea>
+              <label style="display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); margin-bottom:8px;">
+                <input type="checkbox" ${(appConfig.wrestlerAllowHighlights ? "checked" : "")} onchange="appConfig.wrestlerAllowHighlights = this.checked; persist();" />
+                Allow wrestlers Highlights (page + Editor on highlight folders when you share)
+              </label>
+              <button type="button" class="btn btn-gold" style="font-size:11px;" onclick="shareTeamFoldersWithWrestlers()">Share with wrestlers</button>
+            </div>
+
             <label class="field-label">Default Save/Upload Location</label>
             <select class="select" style="margin-bottom:10px;" onchange="appConfig.downloadTarget = this.value; persist(); try { render(); } catch (e) {} toast(this.value === 'drive' ? 'Save, Load, MatScorer import/export, and Load Season use Google Drive when connected.' : 'Save, Load, MatScorer import/export, and Load Season use local hard drive only.', 'info', 5000);">
               <option value="drive" ${(appConfig.downloadTarget || 'drive') === 'drive' ? 'selected' : ''}>Google Drive (default)</option>
@@ -17963,6 +18250,23 @@ const aiBody = `
               <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
                 <button class="btn btn-green" style="flex:2;" onclick="submitHighlightReelFromModal()">Create Highlight</button>
                 <button class="btn" style="flex:1; background:var(--panelLine); color:var(--chalk);" onclick="closeModal()">Cancel</button>
+              </div>
+            </div>
+          </div>`;
+        return;
+      }
+      if (activeModal === "role-select") {
+        root.innerHTML = `
+          <div class="modal-overlay">
+            <div class="modal-box" style="max-width:420px;" onclick="event.stopPropagation()">
+              <div class="card-title">Who is using Strategic Wrestler?</div>
+              <p style="font-size:13px; color:var(--chalk); line-height:1.45; margin:0 0 12px 0;">
+                <strong>Wrestlers</strong> can view stats/schedule, print, and Load (use your own Google account — team folders are shared as Viewer).<br/><br/>
+                <strong>Coaches</strong> need the coach PIN to edit, save, and open Admin.
+              </p>
+              <div style="display:flex; flex-direction:column; gap:8px;">
+                <button class="btn btn-gold" onclick="closeModal(); enterWrestlerMode();">Continue as Wrestler</button>
+                <button class="btn btn-green" onclick="closeModal(); enterCoachModeWithPin();">Coach (PIN required)</button>
               </div>
             </div>
           </div>`;
@@ -20474,6 +20778,196 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         appConfig.googleDriveFolderName = n;
       }
     }
+
+    /** Share a Drive file/folder with a user by email (sends Google invite). role: reader|writer|commenter */
+    async function shareDriveFileWithEmail(fileId, email, role) {
+      if (!fileId) throw new Error("No folder/file id");
+      const em = String(email || "").trim().toLowerCase();
+      if (!em || em.indexOf("@") < 0) throw new Error("Invalid email: " + email);
+      const r = (role === "reader" || role === "commenter") ? role : "writer";
+      const body = {
+        type: "user",
+        role: r,
+        emailAddress: em,
+        sendNotificationEmail: true
+      };
+      const res = await driveFetch(
+        "/files/" + encodeURIComponent(fileId) + "/permissions?sendNotificationEmail=true&supportsAllDrives=true",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        }
+      );
+      if (!res.ok) {
+        const errText = await res.text().catch(function () { return res.statusText; });
+        throw new Error(errText || ("Share failed (" + res.status + ")"));
+      }
+      return res.json().catch(function () { return {}; });
+    }
+
+    function collectTeamDriveFolderIds() {
+      const ids = [];
+      const seen = {};
+      function add(id, label) {
+        if (!id || seen[id]) return;
+        seen[id] = true;
+        ids.push({ id: id, label: label || id });
+      }
+      add(appConfig.googleDriveRootFolderId || appConfig.googleDriveFolderId, "Strategic Wrestler (root)");
+      add(appConfig.googleDriveFolderId, "Backups");
+      add(appConfig.googleDriveExportsFolderId, "Exports");
+      add(appConfig.googleDriveArchivesFolderId, "Season Archives");
+      add(appConfig.googleDriveAiLibraryFolderId, "AI Library");
+      add(appConfig.googleDriveMatSideFolderId, "MatScorer");
+      return ids;
+    }
+
+    function collectHighlightDriveFolderIds() {
+      const ids = [];
+      const seen = {};
+      function add(id, label) {
+        if (!id || seen[id]) return;
+        seen[id] = true;
+        ids.push({ id: id, label: label || id });
+      }
+      add(appConfig.googleDriveHighlightClipsFolderId, "Highlight Clips");
+      add(appConfig.googleDriveHighlightReelsFolderId, "Highlight Reels");
+      return ids;
+    }
+
+    async function resolveHighlightDriveFolders() {
+      try {
+        if (typeof ensureHighlightFolders === "function") await ensureHighlightFolders();
+      } catch (e) {}
+      let folders = collectHighlightDriveFolderIds();
+      if (folders.length >= 2) return folders;
+      // Resolve by path if IDs not stored yet
+      try {
+        if (typeof ensureDriveSubfolderPath === "function") {
+          const c = await ensureDriveSubfolderPath(["Highlight Clips"]);
+          const r = await ensureDriveSubfolderPath(["Highlight Reels"]);
+          if (c) appConfig.googleDriveHighlightClipsFolderId = c;
+          if (r) appConfig.googleDriveHighlightReelsFolderId = r;
+          try { persist(); } catch (e) {}
+        }
+      } catch (e) {}
+      return collectHighlightDriveFolderIds();
+    }
+
+    
+    
+    async function shareFoldersListWithEmails(emailList, folders, role, whoLabel) {
+      if (typeof guardWrestlerWrite === "function" && guardWrestlerWrite("Share Drive")) return { ok: 0, fail: 0, results: [] };
+      if (typeof isGoogleSignedIn === "function" && !isGoogleSignedIn()) {
+        toast("Connect Google Drive first.", "error");
+        return { ok: 0, fail: 0, results: [] };
+      }
+      const raw = (emailList || "").split(/[\n,;]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+      if (!raw.length) {
+        toast("Enter at least one " + (whoLabel || "email") + ".", "error");
+        return { ok: 0, fail: 0, results: [] };
+      }
+      folders = folders || [];
+      if (!folders.length) {
+        toast("No Drive folders to share.", "error", 5000);
+        return { ok: 0, fail: 0, results: [] };
+      }
+      const r = (role === "reader" || role === "commenter") ? role : "writer";
+      const results = [];
+      let ok = 0, fail = 0;
+      for (let ei = 0; ei < raw.length; ei++) {
+        const em = raw[ei];
+        for (let fi = 0; fi < folders.length; fi++) {
+          const f = folders[fi];
+          try {
+            await shareDriveFileWithEmail(f.id, em, r);
+            results.push("OK " + em + " → " + f.label + " (" + r + ")");
+            ok++;
+          } catch (err) {
+            results.push("FAIL " + em + " → " + f.label + ": " + (err.message || err));
+            fail++;
+          }
+        }
+      }
+      try { console.log("SW share results", results); } catch (e) {}
+      return { ok: ok, fail: fail, results: results };
+    }
+
+    async function shareTeamFoldersWithEmails(emailList, role, whoLabel) {
+      let folders = collectTeamDriveFolderIds();
+      if (!folders.length) {
+        try {
+          if (typeof ensureGoogleDriveFolderStructure === "function") await ensureGoogleDriveFolderStructure();
+        } catch (e) {}
+        folders = collectTeamDriveFolderIds();
+      }
+      if (!folders.length) {
+        toast("No Drive folders configured. Use Create / verify folders first.", "error", 6000);
+        return;
+      }
+      const r = (role === "reader" || role === "commenter") ? role : "writer";
+      toast("Sharing " + folders.length + " folder(s) with " + ((emailList || "").split(/[\n,;]+/).filter(Boolean).length) + " " + (whoLabel || "user(s)") + "…", "info", 4000);
+      const res = await shareFoldersListWithEmails(emailList, folders, r, whoLabel);
+      if (res.fail) {
+        toast("Share finished with errors:\n" + res.results.filter(function (x) { return x.indexOf("FAIL") === 0; }).slice(0, 5).join("\n"), "error", 14000);
+      } else if (res.ok) {
+        toast("Shared with " + (whoLabel || "users") + " as " + r + ". Google will email them.", "success", 7000);
+      }
+    }
+
+    async function shareTeamFoldersWithCoaches() {
+      await shareTeamFoldersWithEmails(appConfig.coachShareEmails || "", "writer", "coach(es)");
+    }
+
+    async function shareTeamFoldersWithWrestlers() {
+      if (typeof guardWrestlerWrite === "function" && guardWrestlerWrite("Share Drive")) return;
+      if (typeof isGoogleSignedIn === "function" && !isGoogleSignedIn()) {
+        toast("Connect Google Drive first.", "error");
+        return;
+      }
+      const emails = appConfig.wrestlerShareEmails || "";
+      const raw = emails.split(/[\n,;]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+      if (!raw.length) {
+        toast("Enter at least one wrestler email.", "error");
+        return;
+      }
+      let teamFolders = collectTeamDriveFolderIds();
+      if (!teamFolders.length) {
+        try {
+          if (typeof ensureGoogleDriveFolderStructure === "function") await ensureGoogleDriveFolderStructure();
+        } catch (e) {}
+        teamFolders = collectTeamDriveFolderIds();
+      }
+      if (!teamFolders.length) {
+        toast("No Drive folders configured. Use Create / verify folders first.", "error", 6000);
+        return;
+      }
+      toast("Sharing team folders as Viewer" + (appConfig.wrestlerAllowHighlights ? " + Highlight folders as Editor" : "") + "…", "info", 5000);
+      const viewRes = await shareFoldersListWithEmails(emails, teamFolders, "reader", "wrestler(s)");
+      let editRes = { ok: 0, fail: 0, results: [] };
+      if (appConfig.wrestlerAllowHighlights) {
+        const hlFolders = await resolveHighlightDriveFolders();
+        if (!hlFolders.length) {
+          toast("Could not create/find Highlight Clips or Highlight Reels folders.", "error", 7000);
+        } else {
+          editRes = await shareFoldersListWithEmails(emails, hlFolders, "writer", "wrestler(s)");
+        }
+      }
+      const fails = []
+        .concat(viewRes.results || [], editRes.results || [])
+        .filter(function (x) { return x.indexOf("FAIL") === 0; });
+      if (fails.length) {
+        toast("Share finished with errors:\n" + fails.slice(0, 6).join("\n"), "error", 14000);
+      } else {
+        const msg = appConfig.wrestlerAllowHighlights
+          ? ("Wrestlers have Viewer on team data and Editor only on Highlight Clips & Highlight Reels (" + raw.length + " accounts).")
+          : ("Wrestlers have Viewer on team folders only (" + raw.length + " accounts). Enable Highlights to grant Editor on highlight folders.");
+        toast(msg, "success", 9000);
+      }
+    }
+
+
     async function createGoogleDriveFolder(name, parentId) {
       const meta = {
         name: String(name || "Folder").trim() || "Folder",
@@ -21586,6 +22080,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
      * Ensures Drive has the latest Backups / Exports / Archives / AI Library / MatScorer files.
      */
     async function syncLocalFoldersToGoogleDrive() {
+      if (typeof guardWrestlerWrite === "function" && guardWrestlerWrite("Drive Sync")) return null;
       try {
         if (typeof guardPresenceEdit === "function" && guardPresenceEdit("Drive Sync")) return;
         if (typeof isGoogleSignedIn !== "function" || !isGoogleSignedIn()) {
@@ -21721,6 +22216,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
 
     async function saveSharedSeasonData() {
+      if (typeof guardWrestlerWrite === "function" && guardWrestlerWrite("Save")) return;
       try {
         const target = resolveIoTarget("Save");
         if (target == null) return;
@@ -22235,6 +22731,30 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-25-wrestler-highlight-folder-share",
+        items: [
+          "Wrestler Drive share: Viewer on team data; optional Editor only on Highlight Clips & Highlight Reels"
+        ]
+      },
+
+      {
+        build: "2026-10-25-coach-pin-wrestler-emails",
+        items: [
+          "Coach PIN required for coach mode; wrestlers continue without a PIN",
+          "Admin: share Drive folders with coach emails (Editor) and wrestler emails (Viewer, unlimited)",
+          "PIN reset available when team license is active on the device"
+        ]
+      },
+
+      {
+        build: "2026-10-25-coach-share-wrestler",
+        items: [
+          "Admin: share Strategic Wrestler Google Drive folders with coach emails (Editor/Viewer)",
+          "Wrestler mode: access code, limited pages, Load/print only; optional Highlights"
+        ]
+      },
+
       {
         build: "2026-10-24-ui-polish",
         items: [
