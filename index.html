@@ -4898,24 +4898,59 @@
       toast("Coach mode unlocked.", "success");
     }
 
-    function offerRoleSelectOnStartup() {
+    function emailInList(email, listStr) {
+      const em = String(email || "").trim().toLowerCase();
+      if (!em) return false;
+      const raw = String(listStr || "").split(/[\n,;]+/).map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
+      return raw.indexOf(em) >= 0;
+    }
+
+    /** Resolve coach vs wrestler from Google account email (coach list / wrestler list / license). */
+    function applyRoleFromGoogleEmail(optEmail) {
+      const email = String(optEmail || (typeof googleUserEmail === "string" ? googleUserEmail : "") || "").trim().toLowerCase();
+      if (!email) return false;
+      let licensed = "";
       try {
-        if (sessionStorage.getItem("sw-role-prompted") === "1") {
-          try { updateRoleChrome(); } catch (e) {}
-          return;
-        }
-        sessionStorage.setItem("sw-role-prompted", "1");
-        // If coach PIN is configured, default to wrestler until PIN unlock (unless already unlocked this session)
-        let unlocked = false;
-        try { unlocked = sessionStorage.getItem("sw-coach-unlocked") === "1"; } catch (e) {}
-        if (coachPinIsSet() && !unlocked) {
-          setUserRole("wrestler");
-          activeModal = "role-select";
-          try { renderModal(); } catch (e) { render(); }
+        const state = typeof ensureLicenseState === "function" ? ensureLicenseState() : null;
+        licensed = String((state && state.licensedEmail) || "").trim().toLowerCase();
+      } catch (e) {}
+      const isCoachEmail =
+        (licensed && email === licensed) ||
+        emailInList(email, appConfig.coachShareEmails);
+      const isWrestlerEmail = emailInList(email, appConfig.wrestlerShareEmails);
+      if (isCoachEmail && !isWrestlerEmail) {
+        try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+        setUserRole("coach");
+        return true;
+      }
+      if (isWrestlerEmail && !isCoachEmail) {
+        setUserRole("wrestler");
+        return true;
+      }
+      // Both lists or neither: prefer coach if licensed match, else leave current
+      if (isCoachEmail) {
+        try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+        setUserRole("coach");
+        return true;
+      }
+      return false;
+    }
+
+    function offerRoleSelectOnStartup() {
+      // No startup coach/wrestler popup — role comes from Google sign-in lists (or Unlock Coach PIN)
+      try {
+        if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
+          applyRoleFromGoogleEmail();
         } else {
-          if (!swUserRole) setUserRole("coach");
-          try { updateRoleChrome(); } catch (e) {}
+          let unlocked = false;
+          try { unlocked = sessionStorage.getItem("sw-coach-unlocked") === "1"; } catch (e) {}
+          if (coachPinIsSet() && !unlocked) {
+            setUserRole("wrestler");
+          } else if (!swUserRole) {
+            setUserRole("coach");
+          }
         }
+        try { updateRoleChrome(); } catch (e) {}
       } catch (e) {}
     }
 
@@ -6078,6 +6113,20 @@
       if (!m) { const n = Number(str); return isNaN(n) ? 0 : n; }
       return parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + (m[3] ? Number("0." + m[3]) : 0);
     }
+    function formatDayMonthYearSW(dateStr) {
+      try {
+        const d = dateStr ? new Date(dateStr + (String(dateStr).length <= 10 ? "T12:00:00" : "")) : new Date();
+        if (isNaN(d.getTime())) return "unknown-date";
+        const dd = String(d.getDate()).padStart(2, "0");
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const yy = String(d.getFullYear());
+        return dd + "-" + mm + "-" + yy;
+      } catch (e) { return "unknown-date"; }
+    }
+    /** MatScorer-style: Wrestler_Opponent_DD-MM-YYYY */
+    function highlightClipFileBase(wrestlerName, opponent, dateStr) {
+      return safeFolderSlug(wrestlerName) + "_" + safeFolderSlug(opponent || "Opponent") + "_" + formatDayMonthYearSW(dateStr);
+    }
     function safeFolderSlug(s) {
       return String(s || "unknown").replace(/[^\w\s\-]+/g, "").trim().replace(/\s+/g, "_").slice(0, 60) || "unknown";
     }
@@ -6205,25 +6254,57 @@
       const season = getActiveSeason();
       const bout = (season.bouts || []).find(b => b.id === d.boutId) || (typeof getActiveBout === "function" ? getActiveBout() : null);
       const wrestler = (season.roster || []).find(w => w.id === d.wrestlerId) || (typeof getActiveWrestler === "function" ? getActiveWrestler() : null);
-      const eventName = bout ? (bout.opponent || bout.name || bout.location || "Event") : "Event";
+      const opponent = bout ? (bout.opponent || bout.name || "Opponent") : "Opponent";
+      const eventName = opponent;
       const wrestlerName = wrestler ? wrestler.name : "Wrestler";
+      const dateStr = (bout && bout.date) || (d.date) || "";
       const id = "hl_" + Date.now().toString(36);
+      const baseName = highlightClipFileBase(wrestlerName, opponent, dateStr);
+      const timeTag = formatSecAsTimestamp(startSec).replace(":", "-") + "_" + formatSecAsTimestamp(endSec).replace(":", "-");
+      const fileBase = baseName + "_" + timeTag;
+      const wrestlerFolder = safeFolderSlug(wrestlerName);
       const clip = {
-        id, boutId: d.boutId || "", wrestlerId: d.wrestlerId || "", eventName, wrestlerName,
+        id, boutId: d.boutId || "", wrestlerId: d.wrestlerId || "", eventName, opponent, wrestlerName,
+        date: dateStr,
         startSec, endSec, durationSec: Math.round((endSec - startSec) * 10) / 10,
         label: ((document.getElementById("hl-label") || {}).value || ""),
         createdAt: new Date().toISOString(),
-        folderPath: "Highlight Clips/" + safeFolderSlug(eventName) + "/" + safeFolderSlug(wrestlerName)
+        selected: true,
+        fileBase,
+        folderPath: "Highlight Clips/" + wrestlerFolder,
+        videoFileName: null,
+        driveSaved: false
       };
       highlightClipsStore.push(clip);
       try { localStorage.setItem("sw-highlight-clips", JSON.stringify(highlightClipsStore)); } catch (e) {}
       await ensureHighlightFolders();
-      // Persist clip marker JSON under Highlight Clips on Drive (when connected)
+
+      // Try to cut real video via local clip server when a source file is available
+      let videoBlob = null;
+      try {
+        videoBlob = await extractHighlightClipVideoBlob(startSec, endSec, fileBase + ".mp4");
+        if (videoBlob) {
+          clip.videoFileName = fileBase + ".mp4";
+          clip.hasVideo = true;
+        }
+      } catch (e) { console.warn("clip extract", e); }
+
+      // Upload under Highlight Clips / {Wrestler}/
       try {
         if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn() && appConfig.googleDriveHighlightClipsFolderId) {
-          const fname = safeFolderSlug(clip.eventName) + "_" + safeFolderSlug(clip.wrestlerName) + "_" + clip.id + ".json";
+          let destId = appConfig.googleDriveHighlightClipsFolderId;
+          try {
+            if (typeof findOrCreateGoogleDriveFolder === "function") {
+              const sub = await findOrCreateGoogleDriveFolder(wrestlerFolder, destId);
+              if (sub && sub.id) destId = sub.id;
+            }
+          } catch (e) {}
+          if (videoBlob && typeof uploadBlobToGoogleDrive === "function") {
+            await uploadBlobToGoogleDrive(destId, fileBase + ".mp4", videoBlob, videoBlob.type || "video/mp4");
+            clip.driveSaved = true;
+          }
           if (typeof uploadTextToGoogleDrive === "function") {
-            await uploadTextToGoogleDrive(appConfig.googleDriveHighlightClipsFolderId, fname, JSON.stringify(clip, null, 2));
+            await uploadTextToGoogleDrive(destId, fileBase + ".json", JSON.stringify(clip, null, 2));
             clip.driveSaved = true;
           }
         }
@@ -6233,9 +6314,54 @@
       try { localStorage.setItem("sw-highlight-clips", JSON.stringify(highlightClipsStore)); } catch (e) {}
       highlightClipDraft = null;
       closeModal();
-      const where = clip.driveSaved ? "Google Drive → Highlight Clips" : "local (connect Drive to sync)";
-      toast("Highlight marked " + formatSecAsTimestamp(startSec) + "–" + formatSecAsTimestamp(endSec) + " · " + where, "success", 6000);
+      const where = clip.driveSaved
+        ? ("Drive → Highlight Clips/" + wrestlerFolder + (clip.hasVideo ? " (.mp4 + .json)" : " (.json only — start clip server for .mp4)"))
+        : "local only — connect Drive; start clip server for .mp4 cuts";
+      toast("Selected clip " + formatSecAsTimestamp(startSec) + "–" + formatSecAsTimestamp(endSec) + " · " + where, "success", 7000);
       try { if (currentTab === "highlights") render(); } catch (e) {}
+    }
+
+    /** Cut a segment via local clip server (ffmpeg). Returns Blob or null. */
+    async function extractHighlightClipVideoBlob(startSec, endSec, outName) {
+      let file = null;
+      try {
+        if (currentTab === "highlights" && typeof selectedVideoFile !== "undefined" && selectedVideoFile) file = selectedVideoFile;
+      } catch (e) {}
+      if (!file) {
+        try {
+          if (typeof selectedVideoFile !== "undefined" && selectedVideoFile) file = selectedVideoFile;
+        } catch (e) {}
+      }
+      if (!file) return null;
+      const base = (typeof getClipServerUrl === "function" ? getClipServerUrl() : "") || "http://localhost:5057";
+      const url = String(base).replace(/\/$/, "") + "/highlight-clip";
+      const fd = new FormData();
+      fd.append("video", file, file.name || "source.mp4");
+      fd.append("start", String(startSec));
+      fd.append("end", String(endSec));
+      fd.append("name", outName || "clip.mp4");
+      const res = await fetch(url, { method: "POST", body: fd });
+      if (!res.ok) return null;
+      const blob = await res.blob();
+      if (!blob || blob.size < 100) return null;
+      return blob;
+    }
+
+    function toggleHighlightClipSelected(clipId) {
+      const c = (highlightClipsStore || []).find(x => x.id === clipId);
+      if (!c) return;
+      c.selected = !c.selected;
+      try { localStorage.setItem("sw-highlight-clips", JSON.stringify(highlightClipsStore)); } catch (e) {}
+      try { render(); } catch (e) {}
+    }
+
+    function clearHighlightClips() {
+      if (!(highlightClipsStore || []).length) return;
+      if (!confirm("Clear all selected/marked clips from this device list?")) return;
+      highlightClipsStore = [];
+      try { localStorage.setItem("sw-highlight-clips", JSON.stringify(highlightClipsStore)); } catch (e) {}
+      try { render(); } catch (e) {}
+      toast("Clips cleared.", "success");
     }
     function openHighlightReelModal() {
       highlightReelDraft = { boutId: "all", wrestlerId: "all", musicMode: "prompt", musicPrompt: "upbeat sports highlight energy", targetLengthSec: 60 };
@@ -6248,10 +6374,10 @@
       const targetLengthSec = Math.max(15, Number((document.getElementById("hr-length") || {}).value) || 60);
       const mode = ((document.getElementById("hr-music-mode") || {}).value) || "prompt";
       const musicPrompt = ((document.getElementById("hr-music-prompt") || {}).value || "").trim();
-      let clips = (highlightClipsStore || []).slice();
+      let clips = (highlightClipsStore || []).filter(c => c.selected !== false);
       if (boutId && boutId !== "all") clips = clips.filter(c => c.boutId === boutId);
       if (wrestlerId && wrestlerId !== "all") clips = clips.filter(c => c.wrestlerId === wrestlerId);
-      if (!clips.length) { toast("No highlight clips match that filter. Mark clips on Scout first.", "info", 5000); return; }
+      if (!clips.length) { toast("No selected clips match that filter. Check Selected Clips (or mark new ones).", "info", 5000); return; }
       const season = getActiveSeason();
       const bout = (season.bouts || []).find(b => b.id === boutId);
       const wrestler = (season.roster || []).find(w => w.id === wrestlerId);
@@ -16089,10 +16215,18 @@ function computeRawStatsBundle(wrestlerId) {
         toast("Could not open Highlight Reels folder under Strategic Wrestler root.", "error", 6000);
         return;
       }
-      const fname = safeFolderSlug(reel.eventName || "Event") + "_" + safeFolderSlug(reel.wrestlerName || "Wrestler") + "_" + reel.id + ".json";
+      const wrestlerFolder = safeFolderSlug(reel.wrestlerName === "All_Wrestlers" || !reel.wrestlerName ? "Team" : reel.wrestlerName);
+      let destId = folderId;
+      try {
+        if (typeof findOrCreateGoogleDriveFolder === "function") {
+          const sub = await findOrCreateGoogleDriveFolder(wrestlerFolder, folderId);
+          if (sub && sub.id) destId = sub.id;
+        }
+      } catch (e) {}
+      const fname = (reel.fileBase || (safeFolderSlug(reel.wrestlerName) + "_" + safeFolderSlug(reel.eventName))) + "_" + reel.id + ".json";
       try {
         if (typeof uploadTextToGoogleDrive === "function") {
-          await uploadTextToGoogleDrive(folderId, fname, JSON.stringify(reel, null, 2));
+          await uploadTextToGoogleDrive(destId, fname, JSON.stringify(reel, null, 2));
         }
         // If a local video is loaded for this reel, upload it too
         try {
@@ -16100,7 +16234,7 @@ function computeRawStatsBundle(wrestlerId) {
           if (v && v.src && highlightsPlayerUrl && selectedVideoFile) {
             const vname = safeFolderSlug(reel.eventName || "Event") + "_" + safeFolderSlug(reel.wrestlerName || "Wrestler") + "_" + reel.id + (selectedVideoFile.name && selectedVideoFile.name.match(/\.[a-z0-9]+$/i) ? selectedVideoFile.name.match(/\.[a-z0-9]+$/i)[0] : ".mp4");
             if (typeof uploadBlobToGoogleDrive === "function") {
-              await uploadBlobToGoogleDrive(folderId, vname, selectedVideoFile);
+              await uploadBlobToGoogleDrive(destId, vname, selectedVideoFile);
               reel.fileName = vname;
             }
           }
@@ -16218,11 +16352,20 @@ function computeRawStatsBundle(wrestlerId) {
         : `<p style="font-size:11px; color:var(--muted);">No reels for this selection. Create one, then Save to Highlight Reels.</p>`;
 
       const clipListHtml = clipsForSel.length
-        ? `<div style="font-size:11px; color:var(--muted); max-height:120px; overflow:auto;">` +
-          clipsForSel.slice().reverse().slice(0, 40).map(c =>
-            `<div style="padding:3px 0; border-bottom:1px solid var(--panelLine);">${swEsc(c.eventName || "")} · ${swEsc(formatSecAsTimestamp(c.startSec))}-${swEsc(formatSecAsTimestamp(c.endSec))}${c.label ? " · " + swEsc(c.label) : ""}</div>`
-          ).join("") + `</div>`
-        : `<p style="font-size:11px; color:var(--muted);">No marked clips${selId ? " for this wrestler" : ""}.</p>`;
+        ? `<div style="font-size:11px; color:var(--muted); max-height:180px; overflow:auto;">` +
+          clipsForSel.slice().reverse().slice(0, 80).map(c => {
+            const on = c.selected !== false;
+            return `<label style="display:flex; gap:8px; align-items:flex-start; padding:5px 0; border-bottom:1px solid var(--panelLine); cursor:pointer;">
+              <input type="checkbox" ${on ? "checked" : ""} onchange="toggleHighlightClipSelected('${swJs(c.id)}')" style="margin-top:2px;" />
+              <span style="flex:1;">
+                <strong style="color:var(--chalk);">${swEsc(c.fileBase || c.wrestlerName || "")}</strong>
+                <span> · ${swEsc(formatSecAsTimestamp(c.startSec))}-${swEsc(formatSecAsTimestamp(c.endSec))}</span>
+                ${c.hasVideo ? ' <span style="color:var(--green);">· mp4</span>' : ' <span style="color:var(--muted);">· marker</span>'}
+                ${c.label ? "<br/><span style=\"color:var(--muted);\">" + swEsc(c.label) + "</span>" : ""}
+              </span>
+            </label>`;
+          }).join("") + `</div>`
+        : `<p style="font-size:11px; color:var(--muted);">No selected clips${selId ? " for this wrestler" : ""}. Load a video and use Clip Highlight.</p>`;
 
       const playerSrc = highlightsPlayerUrl || (activeReel && (activeReel.objectUrl || activeReel.fileDataUrl)) || "";
 
@@ -16288,7 +16431,11 @@ function computeRawStatsBundle(wrestlerId) {
                 ${reelListHtml}
               </div>
               <div style="margin-top:12px;">
-                <div class="sec-label" style="margin-bottom:6px;">Marked clips ${selId ? "" : "(all)"}</div>
+                <div class="sec-label" style="margin-bottom:6px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                  <span>Selected Clips ${selId ? "" : "(all)"}</span>
+                  <button type="button" class="btn" style="padding:2px 8px; font-size:10px; width:auto; background:var(--panelLine); color:var(--chalk);" onclick="clearHighlightClips()">Clear Clips</button>
+                </div>
+                <p style="font-size:10px; color:var(--muted); margin:0 0 6px 0;">Check clips to include when creating a reel. Names follow MatScorer style: Wrestler_Opponent_date_times.</p>
                 ${clipListHtml}
               </div>
             </div>
@@ -16942,7 +17089,7 @@ ${helpIcon('admin_license_trial')}
             <div style="margin:12px 0; padding:10px; background:var(--mat); border:1px solid var(--panelLine); border-radius:6px;">
               <div class="sub-label" style="margin-bottom:6px;">Share folders with coaches ${typeof helpIcon === "function" ? helpIcon("admin_coach_share") : ""}</div>
               <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">
-                Each coach uses their own Google account. Shares team folders as <strong>Editor</strong> so they can Save/Load.
+                Each coach uses their own Google account. Shares team folders as <strong>Editor</strong> so they can Save/Load. Shared folders appear under <strong>Shared with me</strong> (not My Drive) until they add a shortcut.
               </p>
               <textarea class="input" rows="3" style="width:100%; margin-bottom:8px; font-size:12px;" placeholder="coach1@gmail.com&#10;coach2@school.edu"
                 onchange="appConfig.coachShareEmails = this.value; persist();">${swEsc(appConfig.coachShareEmails || "")}</textarea>
@@ -21005,6 +21152,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
               headers: { Authorization: "Bearer " + googleAccessToken }
             }).then(r => r.ok ? r.json() : null).then(u => {
               if (u && u.email) googleUserEmail = u.email;
+              try { applyRoleFromGoogleEmail(u && u.email); } catch (e) {}
               try { render(); } catch (e) {}
               try { updateIoLocationBadges(); } catch (e) {}
             }).catch(() => {});
@@ -21125,14 +21273,15 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       const em = String(email || "").trim().toLowerCase();
       if (!em || em.indexOf("@") < 0) throw new Error("Invalid email: " + email);
       const r = (role === "reader" || role === "commenter") ? role : "writer";
+      // Query params only for sendNotificationEmail (body field is ignored/invalid)
+      const q = "?sendNotificationEmail=true&supportsAllDrives=true&fields=id,role,emailAddress,type";
       const body = {
         type: "user",
         role: r,
-        emailAddress: em,
-        sendNotificationEmail: true
+        emailAddress: em
       };
       const res = await driveFetch(
-        "/files/" + encodeURIComponent(fileId) + "/permissions?sendNotificationEmail=true&supportsAllDrives=true",
+        "/files/" + encodeURIComponent(fileId) + "/permissions" + q,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -21141,9 +21290,13 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       );
       if (!res.ok) {
         const errText = await res.text().catch(function () { return res.statusText; });
+        // Already shared is OK
+        if (res.status === 400 && /already|exists|duplicate/i.test(errText)) {
+          return { already: true, emailAddress: em };
+        }
         throw new Error(errText || ("Share failed (" + res.status + ")"));
       }
-      return res.json().catch(function () { return {}; });
+      return res.json().catch(function () { return { emailAddress: em, role: r }; });
     }
 
     function collectTeamDriveFolderIds() {
@@ -21257,12 +21410,13 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       if (res.fail) {
         toast("Share finished with errors:\n" + res.results.filter(function (x) { return x.indexOf("FAIL") === 0; }).slice(0, 5).join("\n"), "error", 14000);
       } else if (res.ok) {
-        toast("Shared with " + (whoLabel || "users") + " as " + r + ". Google will email them.", "success", 7000);
+        toast("Shared with " + (whoLabel || "users") + " as " + r + ". They should check Shared with me in Drive (and email).", "success", 9000);
       }
     }
 
     async function shareTeamFoldersWithCoaches() {
       await shareTeamFoldersWithEmails(appConfig.coachShareEmails || "", "writer", "coach(es)");
+      toast("On the other Google account: open drive.google.com → Shared with me (not My Drive). Look for Strategic Wrestler.", "info", 10000);
     }
 
     async function shareTeamFoldersWithWrestlers() {
@@ -23076,6 +23230,15 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-25-role-share-highlights-v2",
+        items: [
+          "Role from Google email lists (no coach/wrestler startup popup)",
+          "Drive share: fixed permissions API; Shared with me guidance",
+          "Highlights: Selected Clips, Clear Clips, MatScorer-style names, wrestler subfolders, mp4 via clip server"
+        ]
+      },
+
       {
         build: "2026-10-25-highlights-root-share-fix",
         items: [

@@ -228,6 +228,70 @@ def create_app():
             return jsonify({"error": "match_id required"}), 400
         return delete_clips(mid)
 
+    @app.route("/highlight-clip", methods=["POST"])
+    def highlight_clip():
+        """Cut a single time range from an uploaded video; return the mp4 bytes."""
+        import tempfile
+        if "video" not in request.files:
+            return jsonify({"error": "video file required"}), 400
+        try:
+            start = float(request.form.get("start", 0))
+            end = float(request.form.get("end", start + 5))
+        except Exception:
+            return jsonify({"error": "invalid start/end"}), 400
+        if end <= start:
+            return jsonify({"error": "end must be after start"}), 400
+        duration = max(0.25, end - start)
+        name = request.form.get("name") or "highlight.mp4"
+        safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(name))[:120]
+        if not safe_name.lower().endswith(".mp4"):
+            safe_name += ".mp4"
+
+        video_file = request.files["video"]
+        tmp_in = None
+        tmp_out = None
+        try:
+            ensure_dirs()
+            suffix = Path(video_file.filename or "in.mp4").suffix or ".mp4"
+            fd_in, tmp_in = tempfile.mkstemp(suffix=suffix, dir=str(AI_LIBRARY))
+            os.close(fd_in)
+            video_file.save(tmp_in)
+            fd_out, tmp_out = tempfile.mkstemp(suffix=".mp4", dir=str(AI_LIBRARY))
+            os.close(fd_out)
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start),
+                "-i", tmp_in,
+                "-t", str(duration),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac", "-movflags", "+faststart",
+                tmp_out,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0 or not Path(tmp_out).exists() or Path(tmp_out).stat().st_size < 100:
+                return jsonify({
+                    "error": "ffmpeg failed",
+                    "stderr": (proc.stderr or "")[-800:],
+                }), 500
+            from flask import send_file
+            return send_file(
+                tmp_out,
+                mimetype="video/mp4",
+                as_attachment=True,
+                download_name=safe_name,
+            )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            for p in (tmp_in, tmp_out):
+                try:
+                    if p and Path(p).exists():
+                        # keep out file until send_file finishes — only delete input
+                        if p == tmp_in:
+                            Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
     return app
 
 
