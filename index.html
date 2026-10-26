@@ -52,8 +52,8 @@
     .header-banner {
       display: block;
       width: 100%;
-      height: 156px;
-      max-height: 156px;
+      height: 104px;
+      max-height: 104px;
       border-radius: 8px;
       border: 1.5px solid var(--gold);
       background: var(--panel);
@@ -134,10 +134,10 @@
     .badge strong { color: var(--gold); }
 
     /* Scope Bar */
-    .scope-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--panelLine); padding: 2px 8px; border-radius: 6px; margin-bottom: 6px; font-size: 10px; gap: 2px; }
-    .scope-bar select { background: var(--mat); color: var(--chalk); border: 1px solid var(--panelLine); border-radius: 4px; padding: 2px 6px; font-size: 10px; outline: none; min-height: 24px; }
-    .scope-bar .btn-toolbar { padding: 3px 10px; font-size: 10px; min-height: 24px; }
-    .scope-bar .sw-io-badge { width: 18px; height: 18px; font-size: 9px; }
+    .scope-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--panelLine); padding: 1px 6px; border-radius: 6px; margin-bottom: 4px; font-size: 9px; gap: 1px; }
+    .scope-bar select { background: var(--mat); color: var(--chalk); border: 1px solid var(--panelLine); border-radius: 4px; padding: 1px 4px; font-size: 9px; outline: none; min-height: 18px; }
+    .scope-bar .btn-toolbar { padding: 2px 8px; font-size: 9px; min-height: 18px; }
+    .scope-bar .sw-io-badge { width: 16px; height: 16px; font-size: 8px; }
     .record-display { font-family: monospace; font-weight: 700; color: var(--gold); }
 
     /* Navigation */
@@ -475,6 +475,7 @@
         </div>
         <div style="display:flex; flex-direction:column; align-items:center; gap:2px;">
           <div style="display:flex; gap:6px; align-items:center; justify-content:center;">
+            <button type="button" class="btn btn-toolbar" style="background:var(--panelLine); color:var(--chalk);" onclick="exportMatSideSync()" title="Export active season roster/events package for MatScorer">Export MatScorer</button>
             <button type="button" class="btn btn-toolbar" style="background:var(--panelLine); color:var(--chalk);" onclick="syncLocalFoldersToGoogleDrive()" title="Upload local Strategic Wrestler folders (Backups, Exports, Archives, AI Library, MatScorer) to the matching Google Drive folders">Drive Sync</button>
             <button type="button" class="btn btn-gold btn-toolbar" onclick="loadSharedSeasonData()" title="Load full backup (Default Save/Upload Location)">Load</button>
             <button type="button" class="btn btn-green btn-toolbar" onclick="saveSharedSeasonData()" title="Save full backup (Default Save/Upload Location)">Save</button>
@@ -4833,22 +4834,26 @@
     }
 
     async function resetCoachPinWithLicense() {
-      // Allow reset when license is activated (same team) — does not reveal old PIN
+      // Allow reset when license is activated — works from Unlock Coach without Admin
       try {
         const state = typeof ensureLicenseState === "function" ? ensureLicenseState() : null;
         if (!state || !state.activated) {
-          toast("Activate your team license first, then you can reset the coach PIN.", "error", 6000);
+          toast("Activate your team license key on this device first (same key as coaches), then reset the PIN.", "error", 7000);
           return;
         }
       } catch (e) {
         toast("Could not verify license for PIN reset.", "error");
         return;
       }
-      const ok = confirm("Reset coach PIN?\n\nAnyone with this team license on this device can set a new PIN. Continue?");
-      if (!ok) return;
+      const okc = confirm("Reset coach PIN?\n\nRequires an active team license on this device. You will set a new PIN next.");
+      if (!okc) return;
       appConfig.coachPinHash = "";
       try { persist(); } catch (e) {}
+      try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+      setUserRole("coach");
       await setCoachPinInteractive();
+      try { updateRoleChrome(); } catch (e) {}
+      try { render(); } catch (e) {}
     }
 
     function enterWrestlerMode() {
@@ -4873,11 +4878,17 @@
         toast("Coach mode.", "success");
         return;
       }
-      const pin = prompt("Enter coach PIN:");
-      if (pin == null) return;
+      const pin = prompt("Enter coach PIN:\n\n(Cancel, then use Forgot PIN if needed)");
+      if (pin == null) {
+        const forgot = confirm("Forgot coach PIN?\n\nReset it using your team license on this device (no Admin page needed).");
+        if (forgot) await resetCoachPinWithLicense();
+        return;
+      }
       if (!(await verifyCoachPin(pin))) {
-        toast("Incorrect coach PIN. Staying in wrestler mode.", "error");
-        enterWrestlerMode();
+        toast("Incorrect coach PIN.", "error");
+        const forgot = confirm("Incorrect PIN. Reset coach PIN via team license?");
+        if (forgot) await resetCoachPinWithLicense();
+        else enterWrestlerMode();
         return;
       }
       try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
@@ -6040,6 +6051,12 @@
     
     function getVideoTimeSeconds() {
       try {
+        if (currentTab === "highlights") {
+          const hv = document.getElementById("highlights-player");
+          if (hv && !isNaN(hv.currentTime)) return Number(hv.currentTime) || 0;
+        }
+      } catch (e) {}
+      try {
         if (typeof getCurrentVideoTimeSec === "function") {
           const t = getCurrentVideoTimeSec();
           if (t != null && !isNaN(t)) return Number(t);
@@ -6109,6 +6126,45 @@
         } catch (eLoc) {}
       } catch (e) { console.warn("highlight folders", e); }
     }
+    
+    function clearHighlightsVideo() {
+      try {
+        if (highlightsPlayerUrl && String(highlightsPlayerUrl).indexOf("blob:") === 0) {
+          URL.revokeObjectURL(highlightsPlayerUrl);
+        }
+      } catch (e) {}
+      highlightsPlayerUrl = null;
+      highlightsActiveReelId = null;
+      try { render(); } catch (e) {}
+    }
+
+    function setHighlightsPlaybackRate(rate) {
+      const r = Number(rate) || 1;
+      videoPlaybackRate = r;
+      try {
+        const v = document.getElementById("highlights-player");
+        if (v) v.playbackRate = r;
+      } catch (e) {}
+      try { render(); } catch (e) {}
+    }
+
+    function openHighlightClipModalFromHighlights() {
+      const v = document.getElementById("highlights-player");
+      if (!v || !v.src) {
+        toast("Load or select a video in Highlights first.", "info", 4000);
+        return;
+      }
+      try { v.pause(); } catch (e) {}
+      openHighlightClipModal();
+    }
+
+    function getActiveVideoForHotkeys() {
+      if (currentTab === "highlights") {
+        return document.getElementById("highlights-player");
+      }
+      return document.querySelector("#tab-content video, video#match-video, video");
+    }
+
     function openHighlightClipModal() {
       try {
         if (ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo();
@@ -6324,37 +6380,64 @@ function pauseVideoAndGetTime() {
 
     /** Keyboard hotkeys active on Scout tab (ignored while typing in inputs). */
     function handleScoutHotkeys(e) {
-      if (currentTab !== "scout") return;
+      if (currentTab !== "scout" && currentTab !== "highlights") return;
       const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : "";
       if (tag === "input" || tag === "textarea" || tag === "select" || (e.target && e.target.isContentEditable)) return;
       if (activeModal) return;
 
       const key = e.key;
+      // Video transport works on Scout and Highlights
       if (key === " " || key === "Spacebar") {
         e.preventDefault();
-        toggleVideoPlayPause();
+        if (currentTab === "highlights") {
+          const v = document.getElementById("highlights-player");
+          if (v) { if (v.paused) v.play(); else v.pause(); }
+        } else {
+          toggleVideoPlayPause();
+        }
         return;
       }
       if (key === "j" || key === "J" || key === "ArrowLeft") {
         e.preventDefault();
-        nudgeVideo(-3);
+        if (currentTab === "highlights") {
+          const v = document.getElementById("highlights-player");
+          if (v) v.currentTime = Math.max(0, (v.currentTime || 0) - 3);
+        } else {
+          nudgeVideo(-3);
+        }
         return;
       }
       if (key === "l" || key === "L" || key === "ArrowRight") {
         e.preventDefault();
-        nudgeVideo(3);
+        if (currentTab === "highlights") {
+          const v = document.getElementById("highlights-player");
+          if (v) v.currentTime = Math.max(0, (v.currentTime || 0) + 3);
+        } else {
+          nudgeVideo(3);
+        }
         return;
       }
       if (key === "[") {
         e.preventDefault();
-        nudgeVideo(-0.1);
+        if (currentTab === "highlights") {
+          const v = document.getElementById("highlights-player");
+          if (v) v.currentTime = Math.max(0, (v.currentTime || 0) - 0.1);
+        } else {
+          nudgeVideo(-0.1);
+        }
         return;
       }
       if (key === "]") {
         e.preventDefault();
-        nudgeVideo(0.1);
+        if (currentTab === "highlights") {
+          const v = document.getElementById("highlights-player");
+          if (v) v.currentTime = Math.max(0, (v.currentTime || 0) + 0.1);
+        } else {
+          nudgeVideo(0.1);
+        }
         return;
       }
+      if (currentTab !== "scout") return;
       if (key === "1") {
         e.preventDefault();
         currentPeriod = "P1";
@@ -13183,8 +13266,8 @@ async function testClipServerConnection() {
         });
         const cardAg = (title, list) => {
           list.sort((a, b) => b.val - a.val);
-          return `<div style="margin-bottom:10px;">
-            <div class="sec-label" style="margin-bottom:4px;">${title}</div>
+          return `<div style="background:var(--mat); border:1px solid var(--panelLine); padding:10px; border-radius:6px;">
+            <div class="sec-label">${swEsc(title)}</div>
             ${buildLeaderboardPodium(list.slice(0, 3), "var(--red)", null)}
           </div>`;
         };
@@ -13526,10 +13609,6 @@ function computeRawStatsBundle(wrestlerId) {
         line("NF3 against", b.nf3a, "nf3a", false),
         line("NF4 against", b.nf4a, "nf4a", false),
         line("NF5 against", b.nf5a || 0, "nf5a", false),
-        line("Reversals", b.rev, "rev"),
-        line("Reversals against", b.revA, "revA", false),
-        line("Escapes", b.esc, "esc"),
-        line("Escapes against", b.escA, "escA", false),
       ];
       if (typeof isCollegeContext === "function" && isCollegeContext()) {
         leftParts.push(line("Riding Points Earned", b.rtPtsEarned || 0, "rtPtsEarned"));
@@ -13537,6 +13616,10 @@ function computeRawStatsBundle(wrestlerId) {
       }
       const leftRows = leftParts.join("");
       const rightRows = [
+        line("Reversals", b.rev, "rev"),
+        line("Reversals against", b.revA, "revA", false),
+        line("Escapes", b.esc, "esc"),
+        line("Escapes against", b.escA, "escA", false),
         line("Penalty pts awarded", b.penAwarded, "penAwarded"),
         line("Penalty pts given", b.penGiven, "penGiven", false),
         line("Pins", b.winPin, "winPin"),
@@ -13946,15 +14029,15 @@ function computeRawStatsBundle(wrestlerId) {
             </div>
             <div class="grid-3" style="margin-bottom:16px;">
               <div style="background:var(--mat); border:1px solid var(--panelLine); padding:8px; border-radius:4px; text-align:center;">
-                <div style="font-size:10px; font-weight:700; color:var(--gold);">Chose Neutral</div>
+                <div class="sec-label" style="color:var(--gold);">Chose Neutral</div>
                 <div style="font-size:18px; font-weight:800; font-family:monospace; color:#fff;">${swEsc(profStats.choices.neutral)}</div>
               </div>
               <div style="background:var(--mat); border:1px solid var(--panelLine); padding:8px; border-radius:4px; text-align:center;">
-                <div style="font-size:10px; font-weight:700; color:var(--gold);">Chose Top</div>
+                <div class="sec-label" style="color:var(--gold);">Chose Top</div>
                 <div style="font-size:18px; font-weight:800; font-family:monospace; color:#fff;">${swEsc(profStats.choices.top)}</div>
               </div>
               <div style="background:var(--mat); border:1px solid var(--panelLine); padding:8px; border-radius:4px; text-align:center;">
-                <div style="font-size:10px; font-weight:700; color:var(--gold);">Chose Bottom</div>
+                <div class="sec-label" style="color:var(--gold);">Chose Bottom</div>
                 <div style="font-size:18px; font-weight:800; font-family:monospace; color:#fff;">${swEsc(profStats.choices.bottom)}</div>
               </div>
             </div>
@@ -16005,11 +16088,26 @@ function computeRawStatsBundle(wrestlerId) {
             </div>
             <div>
               <div class="sec-label" style="margin-bottom:8px;">Viewer</div>
+              <div style="display:flex; justify-content:flex-end; margin-bottom:6px;">
+                ${playerSrc ? `<button type="button" class="btn-remove-video" onclick="clearHighlightsVideo()">✕ Remove Video</button>` : ""}
+              </div>
               <div style="background:#000; border-radius:10px; border:1px solid var(--panelLine); min-height:220px; display:flex; align-items:center; justify-content:center; overflow:hidden;">
                 ${playerSrc
-                  ? `<video id="highlights-player" controls playsinline style="width:100%; max-height:420px; background:#000;" src="${swEsc(playerSrc)}"></video>`
+                  ? `<video id="highlights-player" controls playsinline style="width:100%; max-height:420px; background:#000;" src="${swEsc(playerSrc)}" onloadedmetadata="try{this.playbackRate=videoPlaybackRate||1;}catch(e){}"></video>`
                   : `<div style="padding:24px; text-align:center; color:var(--muted); font-size:13px;">Select a reel or load a video file to watch</div>`}
               </div>
+              <div style="display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:8px; margin-bottom:4px; width:100%;">
+                <span class="sec-label">Playback Speed</span>
+                <div style="display:flex; flex-wrap:wrap; gap:4px;">
+                  ${[0.25, 0.5, 0.75, 1, 1.25, 1.5, 2].map(r => `
+                    <button type="button" class="chip ${videoPlaybackRate === r ? "selected" : ""}" style="min-width:44px; padding:4px 8px;"
+                      onclick="setHighlightsPlaybackRate(${r})">${r === 1 ? "1×" : r + "×"}</button>
+                  `).join("")}
+                </div>
+                <button type="button" class="btn btn-gold" style="padding:4px 10px; font-size:10px; width:auto; margin-left:auto;"
+                  onclick="openHighlightClipModalFromHighlights()" title="Mark a highlight clip at the current video time">Clip Highlight</button>
+              </div>
+              <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">Keys: Space play/pause · J/L or ←/→ ±3s · [/] fine seek (when Highlights tab is open)</p>
               <div style="margin-top:12px;">
                 <div class="sec-label" style="margin-bottom:6px;">Reels ${selId ? "for selection" : "(all)"}</div>
                 ${reelListHtml}
@@ -22785,6 +22883,16 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-25-topbar-highlights-stats",
+        items: [
+          "Top bar shorter; Export MatScorer left of Drive Sync",
+          "Highlights: Remove Video, speeds, Clip Highlight, keyboard seek/play",
+          "Stats layout: choice labels, scored-on avg against cards, raw column balance",
+          "Forgot coach PIN: reset via license from Unlock Coach prompt"
+        ]
+      },
+
       {
         build: "2026-10-25-wrestler-mode-fixes",
         items: [
