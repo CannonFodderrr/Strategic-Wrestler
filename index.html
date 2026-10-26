@@ -134,10 +134,10 @@
     .badge strong { color: var(--gold); }
 
     /* Scope Bar */
-    .scope-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--panelLine); padding: 1px 6px; border-radius: 6px; margin-bottom: 4px; font-size: 9px; gap: 1px; }
-    .scope-bar select { background: var(--mat); color: var(--chalk); border: 1px solid var(--panelLine); border-radius: 4px; padding: 1px 4px; font-size: 9px; outline: none; min-height: 18px; }
-    .scope-bar .btn-toolbar { padding: 2px 8px; font-size: 9px; min-height: 18px; }
-    .scope-bar .sw-io-badge { width: 16px; height: 16px; font-size: 8px; }
+    .scope-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--panelLine); padding: 0 6px; border-radius: 6px; margin-bottom: 4px; font-size: 12px; gap: 2px; line-height: 1.15; }
+    .scope-bar select { background: var(--mat); color: var(--chalk); border: 1px solid var(--panelLine); border-radius: 4px; padding: 0 4px; font-size: 12px; outline: none; min-height: 20px; line-height: 1.1; }
+    .scope-bar .btn-toolbar { padding: 1px 8px; font-size: 12px; min-height: 20px; line-height: 1.1; font-weight: 700; }
+    .scope-bar .sw-io-badge { width: 18px; height: 18px; font-size: 10px; }
     .record-display { font-family: monospace; font-weight: 700; color: var(--gold); }
 
     /* Navigation */
@@ -6082,17 +6082,21 @@
       return String(s || "unknown").replace(/[^\w\s\-]+/g, "").trim().replace(/\s+/g, "_").slice(0, 60) || "unknown";
     }
     /** Create nested folders under Strategic Wrestler root on the user's default Drive. */
-    async function ensureDriveSubfolderPath(parts) {
+    async function ensureDriveSubfolderPath(parts, parentOverride) {
       parts = (parts || []).filter(Boolean);
       if (!parts.length) return null;
       if (typeof isGoogleSignedIn !== "function" || !isGoogleSignedIn()) return null;
       if (typeof findOrCreateGoogleDriveFolder !== "function") return null;
-      let parentId = (appConfig && appConfig.googleDriveFolderId) || null;
+      let parentId = parentOverride || null;
+      if (!parentId) {
+        // Prefer Strategic Wrestler root, not Backups
+        parentId = (appConfig && (appConfig.googleDriveRootFolderId || appConfig.googleDriveFolderId)) || null;
+      }
       if (!parentId) {
         try {
           if (typeof ensureGoogleDriveFolderStructure === "function") {
             await ensureGoogleDriveFolderStructure();
-            parentId = (appConfig && appConfig.googleDriveFolderId) || null;
+            parentId = (appConfig && (appConfig.googleDriveRootFolderId || appConfig.googleDriveFolderId)) || null;
           }
         } catch (e) {}
       }
@@ -6108,13 +6112,22 @@
 
     async function ensureHighlightFolders() {
       try {
-        // Drive (when G is connected / default)
+        // Drive: siblings under Strategic Wrestler root (NOT under Backups)
         if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
-          const clipsId = await ensureDriveSubfolderPath(["Highlight Clips"]);
-          const reelsId = await ensureDriveSubfolderPath(["Highlight Reels"]);
-          if (clipsId) appConfig.googleDriveHighlightClipsFolderId = clipsId;
-          if (reelsId) appConfig.googleDriveHighlightReelsFolderId = reelsId;
-          try { persist(); } catch (e) {}
+          let rootId = (appConfig && appConfig.googleDriveRootFolderId) || null;
+          if (!rootId) {
+            try {
+              if (typeof ensureGoogleDriveFolderStructure === "function") await ensureGoogleDriveFolderStructure();
+              rootId = (appConfig && appConfig.googleDriveRootFolderId) || null;
+            } catch (e) {}
+          }
+          if (rootId) {
+            const clipsId = await ensureDriveSubfolderPath(["Highlight Clips"], rootId);
+            const reelsId = await ensureDriveSubfolderPath(["Highlight Reels"], rootId);
+            if (clipsId) appConfig.googleDriveHighlightClipsFolderId = clipsId;
+            if (reelsId) appConfig.googleDriveHighlightReelsFolderId = reelsId;
+            try { persist(); } catch (e) {}
+          }
         }
         // Local Strategic Wrestler root (when user set local folder)
         try {
@@ -6205,9 +6218,24 @@
       highlightClipsStore.push(clip);
       try { localStorage.setItem("sw-highlight-clips", JSON.stringify(highlightClipsStore)); } catch (e) {}
       await ensureHighlightFolders();
+      // Persist clip marker JSON under Highlight Clips on Drive (when connected)
+      try {
+        if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn() && appConfig.googleDriveHighlightClipsFolderId) {
+          const fname = safeFolderSlug(clip.eventName) + "_" + safeFolderSlug(clip.wrestlerName) + "_" + clip.id + ".json";
+          if (typeof uploadTextToGoogleDrive === "function") {
+            await uploadTextToGoogleDrive(appConfig.googleDriveHighlightClipsFolderId, fname, JSON.stringify(clip, null, 2));
+            clip.driveSaved = true;
+          }
+        }
+      } catch (e) {
+        console.warn("clip drive save", e);
+      }
+      try { localStorage.setItem("sw-highlight-clips", JSON.stringify(highlightClipsStore)); } catch (e) {}
       highlightClipDraft = null;
       closeModal();
-      toast("Highlight marked " + formatSecAsTimestamp(startSec) + "–" + formatSecAsTimestamp(endSec) + " → " + clip.folderPath, "success", 5000);
+      const where = clip.driveSaved ? "Google Drive → Highlight Clips" : "local (connect Drive to sync)";
+      toast("Highlight marked " + formatSecAsTimestamp(startSec) + "–" + formatSecAsTimestamp(endSec) + " · " + where, "success", 6000);
+      try { if (currentTab === "highlights") render(); } catch (e) {}
     }
     function openHighlightReelModal() {
       highlightReelDraft = { boutId: "all", wrestlerId: "all", musicMode: "prompt", musicPrompt: "upbeat sports highlight energy", targetLengthSec: 60 };
@@ -6233,7 +6261,7 @@
         id: "reel_" + Date.now().toString(36), boutId, wrestlerId, eventName, wrestlerName,
         targetLengthSec, musicMode: mode, musicPrompt, clipIds: clips.map(c => c.id), clips,
         folderPath: "Highlight Reels/" + safeFolderSlug(eventName) + "/" + safeFolderSlug(wrestlerName),
-        status: "queued", createdAt: new Date().toISOString()
+        status: "pending_review", createdAt: new Date().toISOString()
       };
       try { localStorage.setItem("sw-highlight-reel-last", JSON.stringify(job)); } catch (e) {}
       try {
@@ -6263,12 +6291,19 @@
         clips.map(c => c.wrestlerName + " @ " + c.eventName + " " + formatSecAsTimestamp(c.startSec) + "-" + formatSecAsTimestamp(c.endSec)).join("; ") +
         ". Music: " + (mode === "prompt" ? (musicPrompt || "upbeat sports") : "use provided audio") + ". Save to " + job.folderPath + ".";
       closeModal();
-      if (serverOk) toast("Highlight reel job sent → " + job.folderPath, "success", 5000);
+      try {
+        if (currentTab === "highlights") {
+          highlightsSelectedWrestlerId = job.wrestlerId === "all" ? null : job.wrestlerId;
+          highlightsActiveReelId = job.id;
+          render();
+        }
+      } catch (e) {}
+      if (serverOk) toast("Reel ready for review under the player — Save to Highlight Reels or Discard.", "success", 6000);
       else {
         try {
           if (navigator.clipboard && navigator.clipboard.writeText) {
             await navigator.clipboard.writeText(aiPrompt);
-            toast("Job saved (" + clips.length + " clips). Server offline — AI prompt copied. Folder: " + job.folderPath, "info", 7000);
+            toast("Reel listed for review (" + clips.length + " clips). Save to Drive when ready. AI prompt copied if server offline.", "info", 7000);
           } else toast("Job saved (" + clips.length + " clips). Automatic render needs clip server. " + job.folderPath, "info", 6000);
         } catch (e) { toast("Job saved (" + clips.length + " clips).", "info", 5000); }
       }
@@ -16024,6 +16059,126 @@ function computeRawStatsBundle(wrestlerId) {
       toast("Loaded " + file.name, "success", 3000);
     }
 
+    
+    function removeHighlightReel(reelId) {
+      if (!reelId) return;
+      if (!confirm("Remove this reel from the list? (Does not delete files already on Google Drive.)")) return;
+      highlightReelsStore = (highlightReelsStore || []).filter(r => r.id !== reelId);
+      try { localStorage.setItem("sw-highlight-reels", JSON.stringify(highlightReelsStore)); } catch (e) {}
+      if (highlightsActiveReelId === reelId) {
+        highlightsActiveReelId = null;
+        try {
+          if (highlightsPlayerUrl && String(highlightsPlayerUrl).indexOf("blob:") === 0) URL.revokeObjectURL(highlightsPlayerUrl);
+        } catch (e) {}
+        highlightsPlayerUrl = null;
+      }
+      try { render(); } catch (e) {}
+      toast("Reel removed from list.", "success");
+    }
+
+    async function saveHighlightReelToDrive(reelId) {
+      const reel = (highlightReelsStore || []).find(r => r.id === reelId);
+      if (!reel) { toast("Reel not found.", "error"); return; }
+      if (typeof isGoogleSignedIn === "function" && !isGoogleSignedIn()) {
+        toast("Connect Google Drive first to save to Highlight Reels.", "error", 5000);
+        return;
+      }
+      await ensureHighlightFolders();
+      const folderId = appConfig.googleDriveHighlightReelsFolderId;
+      if (!folderId) {
+        toast("Could not open Highlight Reels folder under Strategic Wrestler root.", "error", 6000);
+        return;
+      }
+      const fname = safeFolderSlug(reel.eventName || "Event") + "_" + safeFolderSlug(reel.wrestlerName || "Wrestler") + "_" + reel.id + ".json";
+      try {
+        if (typeof uploadTextToGoogleDrive === "function") {
+          await uploadTextToGoogleDrive(folderId, fname, JSON.stringify(reel, null, 2));
+        }
+        // If a local video is loaded for this reel, upload it too
+        try {
+          const v = document.getElementById("highlights-player");
+          if (v && v.src && highlightsPlayerUrl && selectedVideoFile) {
+            const vname = safeFolderSlug(reel.eventName || "Event") + "_" + safeFolderSlug(reel.wrestlerName || "Wrestler") + "_" + reel.id + (selectedVideoFile.name && selectedVideoFile.name.match(/\.[a-z0-9]+$/i) ? selectedVideoFile.name.match(/\.[a-z0-9]+$/i)[0] : ".mp4");
+            if (typeof uploadBlobToGoogleDrive === "function") {
+              await uploadBlobToGoogleDrive(folderId, vname, selectedVideoFile);
+              reel.fileName = vname;
+            }
+          }
+        } catch (e2) { console.warn(e2); }
+        reel.status = "saved";
+        reel.savedAt = new Date().toISOString();
+        reel.driveFolder = "Highlight Reels";
+        try { localStorage.setItem("sw-highlight-reels", JSON.stringify(highlightReelsStore)); } catch (e) {}
+        toast("Saved to Google Drive → Strategic Wrestler → Highlight Reels", "success", 6000);
+        try { render(); } catch (e) {}
+      } catch (err) {
+        toast("Save failed: " + (err.message || err), "error", 7000);
+      }
+    }
+
+    function discardHighlightReelReview(reelId) {
+      removeHighlightReel(reelId);
+    }
+
+    function onHighlightsLoadVideoChosen(input) {
+      const file = input && input.files && input.files[0];
+      if (!file) return;
+      try {
+        if (highlightsPlayerUrl && String(highlightsPlayerUrl).indexOf("blob:") === 0) URL.revokeObjectURL(highlightsPlayerUrl);
+      } catch (e) {}
+      highlightsPlayerUrl = URL.createObjectURL(file);
+      try { selectedVideoFile = file; } catch (e) {}
+      highlightsActiveReelId = null;
+      try { render(); } catch (e) {}
+      toast("Video loaded for clipping. Use Clip Highlight at key moments.", "success", 4000);
+      try { input.value = ""; } catch (e) {}
+    }
+
+    async function viewReelFromDrive() {
+      if (typeof isGoogleSignedIn === "function" && !isGoogleSignedIn()) {
+        toast("Connect Google Drive first.", "error");
+        return;
+      }
+      await ensureHighlightFolders();
+      const folderId = appConfig.googleDriveHighlightReelsFolderId;
+      if (!folderId) {
+        toast("Highlight Reels folder not found. Connect Drive and try again.", "error");
+        return;
+      }
+      try {
+        const files = typeof listDriveFilesInFolder === "function" ? await listDriveFilesInFolder(folderId) : [];
+        const vids = (files || []).filter(f => /\.(mp4|mov|webm|m4v|mkv)$/i.test(f.name || ""));
+        const jsons = (files || []).filter(f => /\.json$/i.test(f.name || ""));
+        if (!vids.length && !jsons.length) {
+          toast("No reels in Highlight Reels yet. Create a reel and Save it first.", "info", 6000);
+          return;
+        }
+        // Prefer video; else show list of JSON names
+        let pick = null;
+        if (vids.length === 1) pick = vids[0];
+        else if (vids.length > 1) {
+          const names = vids.map((f, i) => (i + 1) + ". " + f.name).join("\\n");
+          const ans = prompt("Enter number of reel video to open:\\n" + names);
+          const n = parseInt(ans, 10);
+          if (n >= 1 && n <= vids.length) pick = vids[n - 1];
+        } else if (jsons.length) {
+          toast("Found " + jsons.length + " saved reel job(s) (JSON). Upload/render a video into Highlight Reels to play it, or use Load Video.", "info", 8000);
+          return;
+        }
+        if (!pick) return;
+        const blob = await downloadDriveFileBlob(pick.id);
+        try {
+          if (highlightsPlayerUrl && String(highlightsPlayerUrl).indexOf("blob:") === 0) URL.revokeObjectURL(highlightsPlayerUrl);
+        } catch (e) {}
+        highlightsPlayerUrl = URL.createObjectURL(blob);
+        highlightsActiveReelId = null;
+        try { render(); } catch (e) {}
+        toast("Playing: " + (pick.name || "reel"), "success");
+      } catch (err) {
+        toast("Could not load reel: " + (err.message || err), "error", 6000);
+      }
+    }
+
     function renderHighlights(target) {
       if (!target) return;
       const season = getActiveSeason();
@@ -16051,11 +16206,16 @@ function computeRawStatsBundle(wrestlerId) {
       const reelListHtml = reelsForSel.length
         ? reelsForSel.map(r => {
             const active = highlightsActiveReelId === r.id;
-            const label = (r.eventName || "Reel") + (r.fileName ? " · " + r.fileName : "") + (r.status ? " [" + r.status + "]" : "");
-            return `<button type="button" class="btn" style="width:100%; text-align:left; padding:8px 10px; margin-bottom:4px; font-size:11px; background:${active ? "var(--gold)" : "var(--panelLine)"}; color:${active ? "var(--mat)" : "var(--chalk)"};"
-              onclick="loadHighlightReelForWatch('${swJs(r.id)}')">${swEsc(label)}</button>`;
+            const st = r.status || "";
+            const label = (r.eventName || "Reel") + (r.wrestlerName ? " · " + r.wrestlerName : "") + (r.fileName ? " · " + r.fileName : "") + (st ? " [" + st + "]" : "");
+            return `<div style="display:flex; gap:4px; margin-bottom:4px; align-items:stretch;">
+              <button type="button" class="btn" style="flex:1; text-align:left; padding:8px 10px; font-size:11px; background:${active ? "var(--gold)" : "var(--panelLine)"}; color:${active ? "var(--mat)" : "var(--chalk)"};"
+                onclick="loadHighlightReelForWatch('${swJs(r.id)}')">${swEsc(label)}</button>
+              <button type="button" class="btn" style="padding:6px 8px; font-size:10px; background:var(--redDim); color:var(--red); width:auto;" title="Remove from list"
+                onclick="removeHighlightReel('${swJs(r.id)}')">✕</button>
+            </div>`;
           }).join("")
-        : `<p style="font-size:11px; color:var(--muted);">No reels for this selection. Create one or load a file.</p>`;
+        : `<p style="font-size:11px; color:var(--muted);">No reels for this selection. Create one, then Save to Highlight Reels.</p>`;
 
       const clipListHtml = clipsForSel.length
         ? `<div style="font-size:11px; color:var(--muted); max-height:120px; overflow:auto;">` +
@@ -16072,14 +16232,15 @@ function computeRawStatsBundle(wrestlerId) {
             <span>Highlights</span>
             <span style="margin-left:auto; display:flex; gap:6px; flex-wrap:wrap;">
               <button type="button" class="btn btn-gold" style="padding:4px 10px; font-size:10px; width:auto;" onclick="openHighlightReelModal()">Create Highlight Reel</button>
-              <label class="btn" style="padding:4px 10px; font-size:10px; width:auto; margin:0; cursor:pointer; background:var(--panelLine); color:var(--chalk);">
-                Load reel file
-                <input type="file" accept="video/*" style="display:none;" onchange="onHighlightReelFileChosen(this)" />
+              <label class="btn" style="padding:4px 10px; font-size:10px; width:auto; margin:0; cursor:pointer; background:var(--panelLine); color:var(--chalk);" title="Load a match video to mark clips (filter by wrestler on the left)">
+                Load Video
+                <input type="file" accept="video/*" style="display:none;" onchange="onHighlightsLoadVideoChosen(this)" />
               </label>
+              <button type="button" class="btn" style="padding:4px 10px; font-size:10px; width:auto; background:var(--panelLine); color:var(--chalk);" onclick="viewReelFromDrive()" title="Open a video from Google Drive → Highlight Reels">View Reel</button>
             </span>
           </div>
           <p style="font-size:12px; color:var(--muted); margin:0 0 12px 0;">
-            Mark clips on Scout with <strong>Clip Highlight</strong>. Build reels here. Folders: Highlight Clips / Highlight Reels (Drive when connected).
+            Mark clips on Scout with <strong>Clip Highlight</strong>. Build reels here. Folders sit under Strategic Wrestler (not Backups): Highlight Clips & Highlight Reels. Create reel → review → Save to Drive.
           </p>
           <div style="display:grid; grid-template-columns:minmax(200px,280px) 1fr; gap:14px; align-items:start;">
             <div>
@@ -16108,6 +16269,20 @@ function computeRawStatsBundle(wrestlerId) {
                   onclick="openHighlightClipModalFromHighlights()" title="Mark a highlight clip at the current video time">Clip Highlight</button>
               </div>
               <p style="font-size:10px; color:var(--muted); margin:0 0 8px 0;">Keys: Space play/pause · J/L or ←/→ ±3s · [/] fine seek (when Highlights tab is open)</p>
+              ${(() => {
+                const pending = (highlightReelsStore || []).filter(r => r.status === "pending_review");
+                const focus = (activeReel && activeReel.status === "pending_review") ? activeReel : pending[0];
+                if (!focus) return "";
+                return `<div style="margin:10px 0; padding:10px; border:1px solid var(--gold); border-radius:8px; background:var(--goldDim);">
+                  <div style="font-size:12px; font-weight:800; color:var(--gold); margin-bottom:6px;">Reel ready for review</div>
+                  <div style="font-size:11px; color:var(--chalk); margin-bottom:8px;">${swEsc(focus.eventName || "")} · ${swEsc(focus.wrestlerName || "")} · ${(focus.clips && focus.clips.length) || (focus.clipIds && focus.clipIds.length) || 0} clip(s)</div>
+                  <div style="display:flex; flex-wrap:wrap; gap:8px;">
+                    <button type="button" class="btn btn-green" style="font-size:11px;" onclick="saveHighlightReelToDrive('${swJs(focus.id)}')">Save to Highlight Reels</button>
+                    <button type="button" class="btn btn-red" style="font-size:11px;" onclick="discardHighlightReelReview('${swJs(focus.id)}')">Discard</button>
+                  </div>
+                  <p style="font-size:10px; color:var(--muted); margin:8px 0 0 0;">Save writes to Google Drive → Strategic Wrestler → Highlight Reels (not under Backups).</p>
+                </div>`;
+              })()}
               <div style="margin-top:12px;">
                 <div class="sec-label" style="margin-bottom:6px;">Reels ${selId ? "for selection" : "(all)"}</div>
                 ${reelListHtml}
@@ -20932,6 +21107,19 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     /** Share a Drive file/folder with a user by email (sends Google invite). role: reader|writer|commenter */
+    
+    async function verifyDriveFileExists(fileId) {
+      if (!fileId) return false;
+      try {
+        const res = await driveFetch("/files/" + encodeURIComponent(fileId) + "?fields=id,name,trashed&supportsAllDrives=true");
+        if (!res.ok) return false;
+        const j = await res.json();
+        return !!(j && j.id && !j.trashed);
+      } catch (e) {
+        return false;
+      }
+    }
+
     async function shareDriveFileWithEmail(fileId, email, role) {
       if (!fileId) throw new Error("No folder/file id");
       const em = String(email || "").trim().toLowerCase();
@@ -21047,15 +21235,20 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     async function shareTeamFoldersWithEmails(emailList, role, whoLabel) {
+      try {
+        if (typeof ensureGoogleDriveFolderStructure === "function") await ensureGoogleDriveFolderStructure();
+      } catch (e) {}
       let folders = collectTeamDriveFolderIds();
-      if (!folders.length) {
-        try {
-          if (typeof ensureGoogleDriveFolderStructure === "function") await ensureGoogleDriveFolderStructure();
-        } catch (e) {}
-        folders = collectTeamDriveFolderIds();
+      // Drop stale / missing folder ids (fixes 404 File not found on share)
+      const verified = [];
+      for (let i = 0; i < folders.length; i++) {
+        const f = folders[i];
+        if (await verifyDriveFileExists(f.id)) verified.push(f);
+        else console.warn("SW share skip missing folder", f);
       }
+      folders = verified;
       if (!folders.length) {
-        toast("No Drive folders configured. Use Create / verify folders first.", "error", 6000);
+        toast("No valid Drive folders found. Use Admin → Create / verify folders, then try again.", "error", 7000);
         return;
       }
       const r = (role === "reader" || role === "commenter") ? role : "writer";
@@ -22883,6 +23076,15 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-25-highlights-root-share-fix",
+        items: [
+          "Highlight Clips/Reels under Strategic Wrestler root (not Backups); Save reel after review",
+          "Highlights: Load Video, View Reel, remove reels; clip markers sync to Drive",
+          "Share coaches: verify folder ids (fixes 404 stale root); top-bar font larger, same height"
+        ]
+      },
+
       {
         build: "2026-10-25-topbar-highlights-stats",
         items: [
