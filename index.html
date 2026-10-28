@@ -6127,6 +6127,22 @@
     function highlightClipFileBase(wrestlerName, opponent, dateStr) {
       return safeFolderSlug(wrestlerName) + "_" + safeFolderSlug(opponent || "Opponent") + "_" + formatDayMonthYearSW(dateStr);
     }
+    function formatBoutDropdownLabel(b) {
+      if (!b) return "Event";
+      const parts = [];
+      if (b.date) parts.push(String(b.date));
+      const title = (b.opponent || b.opponentTeam || b.name || "").trim() || "Event";
+      parts.push(title);
+      const typ = (b.type || b.eventType || "").trim();
+      if (typ) parts.push(typ);
+      const div = (b.division || "").trim();
+      if (div && div !== "All") parts.push(div === "Both" ? "Boys/Girls" : div);
+      const ha = (b.homeAway || "").trim();
+      if (ha) parts.push(ha);
+      const loc = (b.location || "").trim();
+      if (loc && loc !== title) parts.push("@ " + loc);
+      return parts.join(" · ");
+    }
     function safeFolderSlug(s) {
       return String(s || "unknown").replace(/[^\w\s\-]+/g, "").trim().replace(/\s+/g, "_").slice(0, 60) || "unknown";
     }
@@ -6377,63 +6393,164 @@
       let clips = (highlightClipsStore || []).filter(c => c.selected !== false);
       if (boutId && boutId !== "all") clips = clips.filter(c => c.boutId === boutId);
       if (wrestlerId && wrestlerId !== "all") clips = clips.filter(c => c.wrestlerId === wrestlerId);
-      if (!clips.length) { toast("No selected clips match that filter. Check Selected Clips (or mark new ones).", "info", 5000); return; }
+      if (!clips.length) {
+        toast("No selected clips match that filter. Check Selected Clips first.", "info", 5000);
+        return;
+      }
       const season = getActiveSeason();
       const bout = (season.bouts || []).find(b => b.id === boutId);
       const wrestler = (season.roster || []).find(w => w.id === wrestlerId);
-      const eventName = boutId === "all" ? "All_Events" : (bout ? (bout.opponent || bout.name || "Event") : "Event");
+      const eventName = boutId === "all"
+        ? "All_Events"
+        : (bout ? (bout.opponent || bout.opponentTeam || bout.name || formatBoutDropdownLabel(bout)) : "Event");
       const wrestlerName = wrestlerId === "all" ? "All_Wrestlers" : (wrestler ? wrestler.name : "Wrestler");
+
+      const key = (typeof getAiApiKeyForBackend === "function")
+        ? getAiApiKeyForBackend("gemini")
+        : "";
+      if (!key) {
+        toast("Add your Gemini API key in Admin (AI settings) to create highlight reels with AI.", "error", 7000);
+        return;
+      }
+
+      const clipLines = clips.map(function (c, idx) {
+        return (idx + 1) + ". id=" + c.id +
+          " wrestler=" + (c.wrestlerName || "") +
+          " opponent=" + (c.opponent || c.eventName || "") +
+          " start=" + formatSecAsTimestamp(c.startSec) +
+          " end=" + formatSecAsTimestamp(c.endSec) +
+          " duration=" + (c.durationSec || (c.endSec - c.startSec)) + "s" +
+          (c.label ? (" label=" + c.label) : "") +
+          (c.hasVideo || c.videoFileName ? " hasVideo=yes" : " hasVideo=no");
+      }).join("\n");
+
+      const systemPrompt =
+        "You are a wrestling highlight editor. Given selected match clips and a music/style prompt, " +
+        "produce a concise edit plan for a highlight reel. Reply with ONLY valid JSON (no markdown) using this shape:\n" +
+        '{"title":"string","targetLengthSec":number,"musicDirection":"string","voiceoverNotes":"string",' +
+        '"orderedClipIds":["id",...],"clipNotes":[{"id":"string","use":true,"trimStartSec":0,"trimEndSec":0,"why":"string"}],' +
+        '"sequenceSummary":"string"}\n' +
+        "Prefer the most exciting moments; stay near target length; only use provided clip ids.";
+
+      const userPrompt =
+        "Team: " + ((typeof branding !== "undefined" && branding && branding.teamName) || "Team") + "\n" +
+        "Event filter: " + eventName + "\n" +
+        "Wrestler filter: " + wrestlerName + "\n" +
+        "Target length (seconds): " + targetLengthSec + "\n" +
+        "Music mode: " + mode + "\n" +
+        "Music / style prompt: " + (musicPrompt || "upbeat sports highlight energy") + "\n\n" +
+        "Selected clips:\n" + clipLines;
+
+      toast("Creating highlight reel with Gemini…", "info", 4000);
+      closeModal();
+
+      let aiText = "";
+      let aiPlan = null;
+      try {
+        aiText = await callGeminiGenerate(key, [{ text: systemPrompt + "\n\n" + userPrompt }], null);
+        try {
+          const cleaned = String(aiText || "").replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+          aiPlan = JSON.parse(cleaned);
+        } catch (parseErr) {
+          aiPlan = { sequenceSummary: String(aiText || "").slice(0, 2000), raw: true };
+        }
+      } catch (err) {
+        toast("Gemini failed: " + (err.message || err), "error", 8000);
+        return;
+      }
+
+      // Reorder clips by AI plan when possible
+      let ordered = clips.slice();
+      if (aiPlan && Array.isArray(aiPlan.orderedClipIds) && aiPlan.orderedClipIds.length) {
+        const byId = {};
+        clips.forEach(function (c) { byId[c.id] = c; });
+        const next = [];
+        aiPlan.orderedClipIds.forEach(function (id) {
+          if (byId[id]) { next.push(byId[id]); delete byId[id]; }
+        });
+        Object.keys(byId).forEach(function (id) { next.push(byId[id]); });
+        ordered = next;
+      }
+
       const job = {
-        id: "reel_" + Date.now().toString(36), boutId, wrestlerId, eventName, wrestlerName,
-        targetLengthSec, musicMode: mode, musicPrompt, clipIds: clips.map(c => c.id), clips,
-        folderPath: "Highlight Reels/" + safeFolderSlug(eventName) + "/" + safeFolderSlug(wrestlerName),
-        status: "pending_review", createdAt: new Date().toISOString()
+        id: "reel_" + Date.now().toString(36),
+        boutId: boutId,
+        wrestlerId: wrestlerId,
+        eventName: eventName,
+        wrestlerName: wrestlerName,
+        targetLengthSec: targetLengthSec,
+        musicMode: mode,
+        musicPrompt: musicPrompt,
+        clipIds: ordered.map(function (c) { return c.id; }),
+        clips: ordered,
+        folderPath: "Highlight Reels/" + safeFolderSlug(wrestlerName === "All_Wrestlers" ? "Team" : wrestlerName),
+        status: "pending_review",
+        createdAt: new Date().toISOString(),
+        aiPlan: aiPlan,
+        aiSummary: (aiPlan && (aiPlan.sequenceSummary || aiPlan.title)) || "AI edit plan ready"
       };
+
       try { localStorage.setItem("sw-highlight-reel-last", JSON.stringify(job)); } catch (e) {}
       try {
         highlightReelsStore = highlightReelsStore || [];
         highlightReelsStore.push(job);
         localStorage.setItem("sw-highlight-reels", JSON.stringify(highlightReelsStore));
       } catch (e) {}
+
       await ensureHighlightFolders();
+
+      // Optional: ask local clip server to stitch available mp4 segments
+      let stitched = false;
+      try {
+        const base = (typeof getClipServerUrl === "function" ? getClipServerUrl() : "") || "http://localhost:5057";
+        const health = await fetch(String(base).replace(/\/$/, "") + "/health", { method: "GET" }).catch(function () { return null; });
+        if (health && health.ok) {
+          const res = await fetch(String(base).replace(/\/$/, "") + "/highlight-reel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ job: job, aiPlan: aiPlan })
+          }).catch(function () { return null; });
+          if (res && res.ok) {
+            stitched = true;
+            try {
+              const ct = res.headers.get("content-type") || "";
+              if (ct.indexOf("video") >= 0) {
+                const blob = await res.blob();
+                if (blob && blob.size > 1000) {
+                  try {
+                    if (highlightsPlayerUrl && String(highlightsPlayerUrl).indexOf("blob:") === 0) URL.revokeObjectURL(highlightsPlayerUrl);
+                  } catch (e) {}
+                  highlightsPlayerUrl = URL.createObjectURL(blob);
+                  job.hasStitchedVideo = true;
+                }
+              } else {
+                const data = await res.json().catch(function () { return null; });
+                if (data && data.status === "ok") stitched = true;
+              }
+            } catch (e) {}
+          }
+        }
+      } catch (e) {}
+
       try {
         if (currentTab === "highlights") {
           highlightsSelectedWrestlerId = job.wrestlerId === "all" ? null : job.wrestlerId;
           highlightsActiveReelId = job.id;
         }
       } catch (e) {}
-      let serverOk = false;
-      try {
-        const base = (typeof getClipServerUrl === "function" ? getClipServerUrl() : "http://localhost:5057") || "http://localhost:5057";
-        const res = await fetch(String(base).replace(/\/$/, "") + "/health", { method: "GET" });
-        if (res.ok) {
-          serverOk = true;
-          await fetch(String(base).replace(/\/$/, "") + "/highlight-reel", {
-            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(job)
-          }).catch(function () {});
-        }
-      } catch (e) {}
-      const aiPrompt = "Create a wrestling highlight reel (~" + targetLengthSec + "s). Clips: " +
-        clips.map(c => c.wrestlerName + " @ " + c.eventName + " " + formatSecAsTimestamp(c.startSec) + "-" + formatSecAsTimestamp(c.endSec)).join("; ") +
-        ". Music: " + (mode === "prompt" ? (musicPrompt || "upbeat sports") : "use provided audio") + ". Save to " + job.folderPath + ".";
-      closeModal();
-      try {
-        if (currentTab === "highlights") {
-          highlightsSelectedWrestlerId = job.wrestlerId === "all" ? null : job.wrestlerId;
-          highlightsActiveReelId = job.id;
-          render();
-        }
-      } catch (e) {}
-      if (serverOk) toast("Reel ready for review under the player — Save to Highlight Reels or Discard.", "success", 6000);
-      else {
-        try {
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            await navigator.clipboard.writeText(aiPrompt);
-            toast("Reel listed for review (" + clips.length + " clips). Save to Drive when ready. AI prompt copied if server offline.", "info", 7000);
-          } else toast("Job saved (" + clips.length + " clips). Automatic render needs clip server. " + job.folderPath, "info", 6000);
-        } catch (e) { toast("Job saved (" + clips.length + " clips).", "info", 5000); }
-      }
+      try { localStorage.setItem("sw-highlight-reels", JSON.stringify(highlightReelsStore)); } catch (e) {}
+      try { render(); } catch (e) {}
+
+      const summary = job.aiSummary ? String(job.aiSummary).slice(0, 120) : "";
+      toast(
+        "AI reel plan ready" + (summary ? (": " + summary) : "") +
+        (stitched ? " · stitch requested" : " · review & Save to Highlight Reels") +
+        ". Full video stitch needs clip server + .mp4 selected clips.",
+        "success",
+        9000
+      );
     }
+
 
 function pauseVideoAndGetTime() {
       if (videoSourceType === "youtube") {
@@ -16419,6 +16536,7 @@ function computeRawStatsBundle(wrestlerId) {
                 return `<div style="margin:10px 0; padding:10px; border:1px solid var(--gold); border-radius:8px; background:var(--goldDim);">
                   <div style="font-size:12px; font-weight:800; color:var(--gold); margin-bottom:6px;">Reel ready for review</div>
                   <div style="font-size:11px; color:var(--chalk); margin-bottom:8px;">${swEsc(focus.eventName || "")} · ${swEsc(focus.wrestlerName || "")} · ${(focus.clips && focus.clips.length) || (focus.clipIds && focus.clipIds.length) || 0} clip(s)</div>
+                  ${focus.aiSummary ? `<div style="font-size:11px; color:var(--muted); margin-bottom:8px; max-height:72px; overflow:auto;">${swEsc(String(focus.aiSummary).slice(0, 400))}</div>` : ""}
                   <div style="display:flex; flex-wrap:wrap; gap:8px;">
                     <button type="button" class="btn btn-green" style="font-size:11px;" onclick="saveHighlightReelToDrive('${swJs(focus.id)}')">Save to Highlight Reels</button>
                     <button type="button" class="btn btn-red" style="font-size:11px;" onclick="discardHighlightReelReview('${swJs(focus.id)}')">Discard</button>
@@ -18695,18 +18813,23 @@ const aiBody = `
         const season = getActiveSeason();
         const bouts = season.bouts || [];
         const roster = season.roster || [];
-        const boutOpts = `<option value="all">All events</option>` + bouts.map(b => `<option value="${swEsc(b.id)}">${swEsc(b.opponent || b.name || b.id)}</option>`).join("");
-        const wrestlerOpts = `<option value="all">All wrestlers</option>` + roster.map(w => `<option value="${swEsc(w.id)}">${swEsc(w.name)}</option>`).join("");
-        const nClips = (highlightClipsStore || []).length;
+        const boutOpts = `<option value="all">All events (duals &amp; tournaments)</option>` + bouts
+          .slice()
+          .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+          .map(b => `<option value="${swEsc(b.id)}">${swEsc(formatBoutDropdownLabel(b))}</option>`)
+          .join("");
+        const wrestlerOpts = `<option value="all">All wrestlers</option>` + roster.map(w => `<option value="${swEsc(w.id)}">${swEsc(w.name)}${w.weightClass ? " (" + swEsc(w.weightClass) + ")" : ""}</option>`).join("");
+        const nClips = (highlightClipsStore || []).filter(c => c.selected !== false).length;
+        const nAll = (highlightClipsStore || []).length;
         root.innerHTML = `
           <div class="modal-overlay" onclick="if(event.target===this) closeModal()">
-            <div class="modal-box" style="max-width:480px;" onclick="event.stopPropagation()">
+            <div class="modal-box" style="max-width:520px;" onclick="event.stopPropagation()">
               <div class="card-title">Create Highlight Reel</div>
-              <p style="font-size:12px; color:var(--muted); margin:0 0 10px 0;">${swEsc(nClips)} marked clip(s) available. Output folder: Highlight Reels / Event / Wrestler.</p>
-              <label style="font-size:11px; color:var(--muted);">Event</label>
-              <select id="hr-bout" class="select">${boutOpts}</select>
+              <p style="font-size:12px; color:var(--muted); margin:0 0 10px 0;">${swEsc(nClips)} selected clip(s) of ${swEsc(nAll)}. Gemini builds the edit plan from your prompt; local clip server stitches .mp4 clips when available.</p>
+              <label style="font-size:11px; color:var(--muted);">Event (from schedule — duals &amp; tournaments)</label>
+              <select id="hr-bout" class="select" style="color:var(--chalk); background:var(--mat); border:1px solid var(--panelLine); width:100%; margin-bottom:8px;">${boutOpts}</select>
               <label style="font-size:11px; color:var(--muted);">Wrestler</label>
-              <select id="hr-wrestler" class="select">${wrestlerOpts}</select>
+              <select id="hr-wrestler" class="select" style="color:var(--chalk); background:var(--mat); border:1px solid var(--panelLine); width:100%; margin-bottom:8px;">${wrestlerOpts}</select>
               <label style="font-size:11px; color:var(--muted);">Target length (seconds)</label>
               <input id="hr-length" class="input" type="number" min="15" max="600" value="60" />
               <label style="font-size:11px; color:var(--muted);">Music</label>
@@ -23230,6 +23353,14 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     const MAT_SCOUT_CHANGELOG = [
+      {
+        build: "2026-10-25-ai-highlight-reel",
+        items: [
+          "Create Highlight Reel uses Gemini + popup prompts for edit plan",
+          "Event dropdown shows schedule duals/tournaments with date · name · type · division"
+        ]
+      },
+
       {
         build: "2026-10-25-role-share-highlights-v2",
         items: [
