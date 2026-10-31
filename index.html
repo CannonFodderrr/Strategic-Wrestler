@@ -449,9 +449,69 @@
       padding-top: 2px;
     }
 
-  </style>
+
+    /* Login gate — role selection before app chrome */
+    #sw-login-gate {
+      position: fixed; inset: 0; z-index: 200000;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: #0e1110;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    #sw-login-gate.sw-login-hidden { display: none !important; }
+    #sw-login-gate .sw-login-logo {
+      width: min(280px, 70vw); height: 120px;
+      border: 2px dashed rgba(201,162,39,0.55);
+      border-radius: 16px;
+      display: flex; align-items: center; justify-content: center;
+      margin-bottom: 28px;
+      background: rgba(28,31,30,0.9);
+    }
+    #sw-login-gate .sw-login-logo-text {
+      text-align: center; color: #C9A227; font-weight: 900;
+      font-size: 22px; letter-spacing: 0.04em; line-height: 1.25;
+      padding: 12px;
+    }
+    #sw-login-gate .sw-login-sub {
+      color: rgba(242,240,230,0.55); font-size: 13px; margin: -12px 0 28px 0;
+    }
+    #sw-login-gate .sw-login-actions {
+      display: flex; gap: 16px; flex-wrap: wrap; justify-content: center;
+    }
+    #sw-login-gate .sw-login-btn {
+      min-width: 160px; padding: 14px 22px; border-radius: 10px;
+      border: 1px solid rgba(201,162,39,0.65);
+      background: #1C1F1E; color: #F2F0E6;
+      font-weight: 800; font-size: 15px; cursor: pointer;
+      letter-spacing: 0.03em;
+    }
+    #sw-login-gate .sw-login-btn:hover {
+      background: rgba(201,162,39,0.18); color: #C9A227;
+    }
+    #sw-login-gate .sw-login-btn.coach {
+      background: #C9A227; color: #1C1F1E; border-color: #C9A227;
+    }
+    #sw-login-gate .sw-login-btn.coach:hover {
+      filter: brightness(1.06);
+    }
+    #sw-login-gate .sw-login-status {
+      margin-top: 20px; min-height: 20px; font-size: 12px;
+      color: rgba(242,240,230,0.7); text-align: center; max-width: 360px;
+    }
+
+</style>
 </head>
 <body>
+  <div id="sw-login-gate" aria-label="Strategic Wrestler login">
+    <div class="sw-login-logo">
+      <div class="sw-login-logo-text">STRATEGIC<br/>WRESTLER</div>
+    </div>
+    <div class="sw-login-sub">Choose how you sign in</div>
+    <div class="sw-login-actions">
+      <button type="button" class="sw-login-btn coach" onclick="loginAsCoach()">Coaches</button>
+      <button type="button" class="sw-login-btn" onclick="loginAsWrestler()">Wrestlers</button>
+    </div>
+    <div class="sw-login-status" id="sw-login-status"></div>
+  </div>
   <div class="container">
     <div id="sw-presence-bar" class="sw-presence-bar" aria-live="polite"></div>
     <div class="header">
@@ -4936,19 +4996,153 @@
       return false;
     }
 
-    function offerRoleSelectOnStartup() {
-      // No startup coach/wrestler popup — role comes from Google sign-in lists (or Unlock Coach PIN)
+    function loginGatePassed() {
+      try { return sessionStorage.getItem("sw-login-passed") === "1"; } catch (e) { return false; }
+    }
+
+    function setLoginGatePassed(role) {
+      try {
+        sessionStorage.setItem("sw-login-passed", "1");
+        if (role) sessionStorage.setItem("sw-login-role", role);
+      } catch (e) {}
+    }
+
+    function showLoginGate() {
+      try {
+        const el = document.getElementById("sw-login-gate");
+        if (el) el.classList.remove("sw-login-hidden");
+      } catch (e) {}
+    }
+
+    function hideLoginGate() {
+      try {
+        const el = document.getElementById("sw-login-gate");
+        if (el) el.classList.add("sw-login-hidden");
+      } catch (e) {}
+    }
+
+    function setLoginStatus(msg) {
+      try {
+        const el = document.getElementById("sw-login-status");
+        if (el) el.textContent = msg || "";
+      } catch (e) {}
+    }
+
+    async function loginConnectGoogleDrive() {
+      setLoginStatus("Connecting Google Drive…");
       try {
         if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
-          applyRoleFromGoogleEmail();
-        } else {
-          let unlocked = false;
-          try { unlocked = sessionStorage.getItem("sw-coach-unlocked") === "1"; } catch (e) {}
-          if (coachPinIsSet() && !unlocked) {
-            setUserRole("wrestler");
-          } else if (!swUserRole) {
-            setUserRole("coach");
+          setLoginStatus("Google Drive already connected.");
+          return true;
+        }
+        if (typeof authGoogleDrive === "function") {
+          await authGoogleDrive();
+        } else if (typeof connectGoogleDrive === "function") {
+          await connectGoogleDrive();
+        } else if (typeof requestGoogleAccessToken === "function") {
+          await requestGoogleAccessToken("consent");
+        }
+      } catch (e) {
+        setLoginStatus("Google Drive connect cancelled or failed. You can connect later from the app.");
+        return false;
+      }
+      try { updateIoLocationBadges(); } catch (e) {}
+      try { await syncTrialWithSupabase(); } catch (e) {}
+      try { await ensureHighlightFolders(); } catch (e) {}
+      return (typeof isGoogleSignedIn === "function" && isGoogleSignedIn());
+    }
+
+    async function loginAsCoach() {
+      setLoginStatus("Coach login…");
+      try {
+        if (typeof coachPinIsSet === "function" && coachPinIsSet()) {
+          const pin = prompt("Enter coach PIN:");
+          if (pin == null) {
+            setLoginStatus("Coach login cancelled.");
+            return;
           }
+          if (!(await verifyCoachPin(pin))) {
+            toast("Incorrect coach PIN.", "error");
+            setLoginStatus("Incorrect coach PIN.");
+            const forgot = confirm("Incorrect PIN. Reset coach PIN using your team license?");
+            if (forgot && typeof resetCoachPinWithLicense === "function") {
+              await resetCoachPinWithLicense();
+            }
+            return;
+          }
+        } else {
+          // No PIN yet — allow coach entry for first-time setup
+          try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+        }
+        try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+        setUserRole("coach");
+        await loginConnectGoogleDrive();
+        try { applyRoleFromGoogleEmail(); } catch (e) {}
+        // Ensure coach if PIN passed (email lists should not demote without PIN)
+        try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+        setUserRole("coach");
+        setLoginGatePassed("coach");
+        hideLoginGate();
+        try {
+          const allowed = ["roster", "scout", "sheet", "stats", "plan", "calendar", "highlights", "admin"];
+          if (allowed.indexOf(currentTab) < 0) currentTab = "roster";
+        } catch (e) {}
+        try { updateRoleChrome(); } catch (e) {}
+        try { render(); } catch (e) {}
+        try { offerLoadLatestBackupPrompt(); } catch (e) {}
+        toast("Coach mode.", "success");
+        setLoginStatus("");
+      } catch (e) {
+        setLoginStatus("Coach login failed: " + (e && e.message ? e.message : e));
+      }
+    }
+
+    async function loginAsWrestler() {
+      setLoginStatus("Wrestler login…");
+      try {
+        setUserRole("wrestler");
+        await loginConnectGoogleDrive();
+        // Prefer wrestler if email is on wrestler list; do not auto-elevate to coach from login path
+        try {
+          const email = (typeof googleUserEmail === "string" && googleUserEmail) ? googleUserEmail : "";
+          if (email && typeof emailInList === "function" && emailInList(email, appConfig.wrestlerShareEmails)) {
+            setUserRole("wrestler");
+          }
+        } catch (e) {}
+        setUserRole("wrestler");
+        setLoginGatePassed("wrestler");
+        hideLoginGate();
+        try {
+          const allowed = typeof wrestlerAllowedTabs === "function" ? wrestlerAllowedTabs() : ["stats"];
+          if (allowed.indexOf(currentTab) < 0) currentTab = allowed[0] || "stats";
+        } catch (e) {}
+        try { updateRoleChrome(); } catch (e) {}
+        try { render(); } catch (e) {}
+        try { offerLoadLatestBackupPrompt(); } catch (e) {}
+        toast("Wrestler mode — view and print only.", "success");
+        setLoginStatus("");
+      } catch (e) {
+        setLoginStatus("Wrestler login failed: " + (e && e.message ? e.message : e));
+      }
+    }
+
+    function offerRoleSelectOnStartup() {
+      // Login gate handles first role choice; only restore chrome after gate passed
+      try {
+        if (!loginGatePassed()) {
+          showLoginGate();
+          return;
+        }
+        hideLoginGate();
+        let role = "";
+        try { role = sessionStorage.getItem("sw-login-role") || ""; } catch (e) {}
+        if (role === "wrestler") {
+          setUserRole("wrestler");
+        } else if (role === "coach") {
+          try { sessionStorage.setItem("sw-coach-unlocked", "1"); } catch (e) {}
+          setUserRole("coach");
+        } else if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
+          applyRoleFromGoogleEmail();
         }
         try { updateRoleChrome(); } catch (e) {}
       } catch (e) {}
@@ -4956,9 +5150,10 @@
 
     function offerGoogleDriveConnectOnStartup() {
       try {
+        // Login gate owns the first Google connect (Coaches / Wrestlers buttons)
+        if (typeof loginGatePassed === "function" && !loginGatePassed()) return;
         if (!googleClientId()) return;
         if (typeof isGoogleSignedIn === "function" && isGoogleSignedIn()) {
-          // Already connected this session — still offer load once
           offerLoadLatestBackupPrompt();
           return;
         }
@@ -5006,6 +5201,11 @@
           if (hr) highlightReelsStore = JSON.parse(hr) || [];
         } catch (e) { highlightReelsStore = []; }
         try { tryAutoConnectGoogleDrive(); } catch (e) {}
+        try {
+          if (typeof connectClipServer === "function") {
+            connectClipServer().catch(function () {});
+          }
+        } catch (e) {}
         try {
           if (typeof isWrestlerMode === "function" && isWrestlerMode()) {
             const allowed = typeof wrestlerAllowedTabs === "function" ? wrestlerAllowedTabs() : ["stats"];
@@ -6828,6 +7028,7 @@ function pauseVideoAndGetTime() {
       applyLayoutOrder();
       syncVideoPlayerVisibility();
       try { updateRoleChrome(); } catch (e) {}
+      try { if (typeof updateClipServerStatusUI === "function") updateClipServerStatusUI(); } catch (e) {}
       renderModal();
     }
 
@@ -6932,14 +7133,21 @@ function pauseVideoAndGetTime() {
 
     /* HELP SYSTEM */
     const HELP_CONTENT = {
+      "admin_singlet": "Used as the default primary singlet color when identifying your wrestler on the Scout page.",
+      "admin_logo": "Sits on top of the banner on the left. PNG with transparent background recommended. Square or portrait logos work best.",
+      "admin_banner": "One banner across the top of the app (about 156 px tall). Design at ~1280 × 312 px (or similar ~4:1). PNG recommended. License status overlays the bottom-right corner. Optional logo overlays the left side.",
+      "stats_raw": "Raw stats shown with quantity/percentage and the wrestler's standing among the team.",
+      "stats_recordbook": "The Record Book maintains school/club single season and career record holders for various stats. The Record Book persists year to year and only shows records set by starter/varsity level athletes.",
+      "roster_events_create": "Schedule dual meets and tournaments. Set the date, type, division, and competition level, then use the clock fields for weigh-in and match start times. Adding an opponent roster here is optional but recommended — those names become selectable opponents on the Scout page, so you are not typing them mid-match.",
+      "roster_add_wrestler": "Add athletes on your active roster. Change the level and grades via the Team Setup in the Admin page.",
       "roster_print": "Pick what to print from the dropdown, then press Print. Roster is the basic weight-class list; Expanded Roster adds contact info; Roster Changes is the add/drop/archive audit trail for the season; Gear Inventory lists every item issued and outstanding. Printing follows the Division and Level filters currently set on this page, so narrow those first if you only want part of the team.",
-      "roster_athletes": "Add and manage athletes on your active roster. Use the Scout, Stats, or Bout Sheet dropdowns to set an athlete as your active focus — the Team Roster list below is for managing details, not selecting. Click 'Edit' on an athlete to set contact info (wrestler + 2 parent phone/email slots) and status flags: INJ (injured), SUSP (suspended), QUIT (no longer on team). The colored pills under each athlete's name show attendance: red = Absences, gold = Excused and Late counts (with any injury-related count in parentheses), and the right-most pill is their overall present rate — green is 90%+, gold is 75-89%, red is below 75%.",
+      "roster_athletes": "Manage athletes on your active roster. Click 'Edit' on an athlete to set contact info (wrestler + 2 parent phone/email slots) and status flags: INJ (injured), SUSP (suspended), QUIT (no longer on team). Additional Status Flags can be created in the Admin page. The Gear Issue button is used to issue/turn in gear to an athlete. The Archive button is used to remove a wrestler from the roster but maintain all stats and dual meet points from that wrestler. The Delete button found in the Edit pop-up window, will permanently delete the wrestler and all stats that wrestler accumulated. Only use Delete when the wrestler was entered in error, never competed and has no stats or team points, otherwise Archive. The colored pills under each athlete's name show attendance: red = Absences, gold = Excused and Late counts (with any injury-related count in parentheses), and the right-most pill is their overall present rate — green is 90%+, gold is 75-89%, red is below 75%.",
       "season_naming": "Season display name is built as: optional Custom Season Name + Year + Wrestling Style. Year can be a single year (2026) or overlapping years (2026-2027). Example: custom 'Winter' + year '2026-2027' + Folkstyle → 'Winter 2026-2027 Folkstyle'. If custom name is blank, the name is just '2026-2027 Folkstyle'.",
       "calendar_tab": "Click the 📅 icon to add a month tab, then click any day to take attendance, create a dual/tournament (same as Roster + Add Bout), or add a custom calendar note. Every wrestler starts each day as unmarked/unknown — use 'Mark All Present' for a normal practice day, then adjust exceptions, or mark athletes individually. A day's attendance snapshot (e.g. '8/10 in attendance - 1 exc, 1 unk') only appears once at least one wrestler has been marked for that day. Boys-only events show blue, Girls-only show pink, and Co-ed show purple. Use the Boys/Girls/Both dropdown in the attendance list to filter who's shown, and type a last name in the jump box to scroll straight to that athlete.",
-      "roster_events": "Schedule dual meets and tournaments. Set the date, type, division, and competition level, then use the clock fields for weigh-in and match start times. Adding an opponent roster here is optional but recommended \u2014 those names become selectable opponents on the Scout page, so you are not typing them mid-match. Once created, an event scopes every stat view: pick it to see results against one opponent, or leave it on the season for cumulative totals.",
+      "roster_events": "Schedule dual meets and tournaments from the above button. Set the date, type, division, and competition level, then use the clock fields for weigh-in and match start times. Adding an opponent roster here is optional but recommended — those names become selectable opponents on the Scout page, so you are not typing them mid-match. The Set Active button sets the event as the active scope to that dual/tournament for stats and scoring. You can also change the Active event from the Event Drop-Down menu located in the Top-Bar.",
       "scout_manual": "Interactive real-time scoring pad. Track offensive and defensive executions, set position choices at period breaks, and tag ties, setups, and finishes for full root-cause analysis. Keyboard (Scout tab): Space play/pause · J / ← rewind 3s · L / → forward 3s · [ ] frame step 0.1s · 1/2/3 set period P1/P2/P3. Timestamps use tenths (MM:SS.s) for sharper auto-clips.",
       "scout_modifiers": "Modifiers record ties/setups, finishes, and rides per wrestler. Apply to Our (green) or Opp (red). Logged as Opp: … Our: … so coaches and AI can tell who did what. Switch tabs for Ties, Finishes, and Rides.",
-      "bout_sheet": "Official dual meet and individual season match ledger. Finalizing dual meets automatically logs team score and updates your overall dual season record.",
+      "bout_sheet": "Official dual meet and individual season match ledger. Finalize locks the active event (dual, tournament, or other) so it cannot be scored until Reopen. For dual meets only, Finalize also logs the team score and updates the season dual W–L–T record. The individual season match ledger can be shown by choosing All Events/Season Total from the event drop-down in the Top-Bar and selecting the wrestler you wish to view.",
       "stats_proficiency": "Positional Proficiency is a net index: (Successes - Failures) / Opportunities in Neutral, Top, and Bottom. Shot % is successful offensive shots ÷ total shots taken (Takedown → Shots subcategory). Proficiency colors: under −0.15 red, −0.15 to 0.25 gold, 0.25+ green. Shot % uses efficiency bands (≥60 green, 40–59 gold, <40 red).",
       "stats_efficiency": "Technique efficiency charts broken down by taxonomy category/sub-group for offensive execution and defensive resistance. Period changes and position choices are excluded. Click any move to inspect which ties led to success or failure.",
       "stats_leaderboard": "Team Leaderboard ranks the top 3 wrestlers across major scoring metrics. Ties for 1st, 2nd, or 3rd are formatted cleanly, noting if more than 3 wrestlers share a rank.",
@@ -6947,7 +7155,7 @@ function pauseVideoAndGetTime() {
       "admin_home_location": "Home Location auto-fills the Location field when you add a Home bout/event on the Roster schedule.",
       "highlights_page": "Mark clips on Scout with Clip Highlight (next to playback speeds). Create Highlight Reel builds a job under Highlight Reels using your default Drive or local folder. Load a finished video to watch in the viewer. Counts show marked clips and reels per wrestler.",
       "scout_clip_highlight": "Pauses the video and lets you set start/end times for a highlight. Saved under Highlight Clips / Event / Wrestler on Drive (if connected) or your local Strategic Wrestler folder.",
-      "stats_halloffame": "Hall of Fame lists every award assignment across all seasons, grouped by year. Awards persist year to year so past recipients remain visible.",
+      "stats_halloffame": "Hall of Fame lists every award assignment across all seasons, grouped by year. Awards persist year to year so past recipients remain visible. Awards can be created on the Admin page.",
       "plan_remediation": "Prescriptive drilling matrix. Surfaces yellow/red positional proficiency (index under 0.25) plus offensive and defensive move gaps below your configured conversion thresholds.",
       "admin_ui": "Screen Layout lets you unlock the app and drag cards into a different order on the Roster, Scout, Bout Sheet, Stats, and Training Plan pages, with a per-page reset if you want the defaults back. The color palette below it recolors the interface; performance bands (red / yellow / green) stay fixed so stat readings never change meaning.",
       "admin_team_setup": "Everything that defines your program: team name, logo and banner, whether girls may wrestle in boys events, which school levels and grades appear in dropdowns, the shared gear inventory, the Training Plan trigger thresholds, and custom awards. These settings carry across seasons, so you normally set them once at the start of the year.",
@@ -6957,7 +7165,7 @@ function pauseVideoAndGetTime() {
       "admin_weight_classes": "Load a preset for your state or level, or build the list by hand. These weights populate every weight dropdown in the app \u2014 Add Wrestler, Edit Athlete, and opponent entry. Boys and Girls lists are separate unless you turn on the option to use boys weight classes for girls.",
       "admin_modifiers": "Ties and setups are the hand position or entry that led into a move; finishes are how it ended; rides are top control positions. Tagging these during scoring is what makes root-cause analysis work \u2014 it is the difference between knowing a single leg failed and knowing it failed off a collar tie every time. Add whatever vocabulary your room actually uses.",
       "admin_custom_flags": "INJ, SUSP, QUIT, and RS always exist. Add your own for anything else you track \u2014 CAPTAIN, ACADEMIC, WEIGHT WATCH, whatever your program uses. A custom flag becomes a toggle on Edit Athlete and shows as a tag on the roster in its chosen color. Deleting a flag here removes it from every athlete it was applied to.",
-      "scout_riding_time": "Click Our RT or Opp RT to set who has control \u2014 the clock runs automatically while the video plays and the button lightly pulses. Click the same button again to pause without losing control; click the other wrestler's button to hand control over. Stop clears the controller entirely. On college seasons the +1 RT button appears automatically to award the riding-time point without touching the clock.",
+      "scout_riding_time": "For manual operation, Click Our RT or Opp RT to set who has control — the clock runs automatically while the video plays and the button lightly pulses. Click the same button again to pause without losing control; click the other wrestler's button to hand control over. Stop clears the controller entirely. On college seasons the +1 RT button appears so the user can manually award the riding-time point. For Semi-Automatic operation the clock starts, stops and switches based on wrestler and opponent's positions as they change. Riding Time is matched to video time and will not continue counting if the user rewinds the video.",
       "admin_taxonomy": "The move taxonomy is the list of techniques available on the scoring pad, grouped by category and subcategory. Add moves your team drills so scoring matches your language, and remove ones you never use to keep the pad uncluttered. Changes apply immediately to the Scout page.",
       "roster_edit_athlete": "Set weight class, minimum weight, grade, and competition level, plus contact info for the athlete and up to two parents or guardians. Status flags mark an athlete as injured (INJ), suspended (SUSP), quit (QUIT), or redshirt (RS) \u2014 flagged athletes stay on the roster and keep their history but are visually separated in lists and print-outs. Archiving removes an athlete from active views without deleting any of their match data.",
       "scout_log": "Every scored action in order, with a timestamp in tenths of a second. Click an entry to edit the move, direction, or modifiers if you mis-tagged something live. Undo steps back one action at a time, newest first. Timestamps are what drive AI clip extraction later, so nudging one to the exact moment of the shot pays off if you plan to use video analysis.",
@@ -12103,14 +12311,14 @@ async function testClipServerConnection() {
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
               <button class="btn btn-gold" onclick="openExpandedBoutSheet()">View Expanded Bout Sheet</button>
-              ${activeBout && activeBout.type === "Dual" ? (
+              ${activeBout && store.activeBoutId && store.activeBoutId !== "all" ? (
                 isSeasonLocked()
                   ? (activeBout.finalized
                       ? `<button class="btn btn-gold" style="opacity:0.45; cursor:not-allowed;" disabled title="Season is locked">Event Finalized</button>`
                       : `<button class="btn btn-green" style="opacity:0.45; cursor:not-allowed;" disabled title="Season is locked">Season Locked</button>`)
                   : (activeBout.finalized
-                      ? `<button class="btn btn-gold" onclick="reopenDualMeet()">Reopen Dual Meet</button>`
-                      : `<button class="btn btn-green" onclick="finalizeDualMeet(${teamScoreOur}, ${teamScoreOpp})">Finalize Dual Meet</button>`)
+                      ? `<button class="btn btn-gold" onclick="reopenDualMeet()">Reopen</button>`
+                      : `<button class="btn btn-green" onclick="finalizeDualMeet(${teamScoreOur}, ${teamScoreOpp})">Finalize</button>`)
               ) : ''}
               <div style="text-align:right; margin-left:10px;">
                 <span style="font-size:20px; font-weight:800; color:var(--green);">${swEsc(teamScoreOur)}</span>
@@ -12161,61 +12369,86 @@ async function testClipServerConnection() {
     }
 
     function finalizeDualMeet(ourPts, oppPts) {
-      if (guardSeasonLocked("finalizing dual meets")) return;
+      if (guardSeasonLocked("finalizing events")) return;
       const season = getActiveSeason();
       const activeBout = getActiveBout();
-      if (!activeBout || activeBout.type !== "Dual") return toast("Only dual meets can be finalized to the dual team record.");
-
-      if (activeBout.finalized) {
-        if (!confirm("This dual was already finalized. Re-finalizing will overwrite the previous dual-record contribution for this bout with the current team score. Continue?")) return;
+      if (!activeBout || !store.activeBoutId || store.activeBoutId === "all") {
+        return toast("Select a specific event before finalizing.");
       }
 
-      const rec = activeBout.division === "Girls" 
-        ? (season.girlsDualRecord || (season.girlsDualRecord = { wins: 0, losses: 0, ties: 0 }))
-        : (season.boysDualRecord || (season.boysDualRecord = { wins: 0, losses: 0, ties: 0 }));
+      const isDual = activeBout.type === "Dual";
+      const eventLabel = isDual ? "dual" : (activeBout.type === "Tournament" ? "tournament" : "event");
 
-      // Undo previous finalize contribution so re-finalize never double-counts
-      // (including ties). Prefer snapshot; if missing on a finalized bout, skip undo
-      // rather than inventing a second entry.
       if (activeBout.finalized) {
-        if (activeBout.finalizedSnapshot) {
-          reverseDualRecordContribution(season, activeBout);
-        } else {
-          console.warn("Re-finalize: bout was finalized without snapshot; dual record may need manual review.");
-        }
+        const msg = isDual
+          ? "This dual was already finalized. Re-finalizing will overwrite the previous dual-record contribution for this bout with the current team score. Continue?"
+          : ("This " + eventLabel + " was already finalized. Re-finalizing will update the lock snapshot. Continue?");
+        if (!confirm(msg)) return;
       }
 
       let outcome = "tie";
-      if (ourPts > oppPts) {
-        rec.wins = (rec.wins || 0) + 1;
-        outcome = "win";
-      } else if (oppPts > ourPts) {
-        rec.losses = (rec.losses || 0) + 1;
-        outcome = "loss";
-      } else {
-        rec.ties = (rec.ties || 0) + 1;
-        outcome = "tie";
+      const our = Number(ourPts) || 0;
+      const opp = Number(oppPts) || 0;
+      if (our > opp) outcome = "win";
+      else if (opp > our) outcome = "loss";
+      else outcome = "tie";
+
+      // Dual team W–L–T only for Dual meets
+      if (isDual) {
+        const rec = activeBout.division === "Girls"
+          ? (season.girlsDualRecord || (season.girlsDualRecord = { wins: 0, losses: 0, ties: 0 }))
+          : (season.boysDualRecord || (season.boysDualRecord = { wins: 0, losses: 0, ties: 0 }));
+
+        // Undo previous finalize contribution so re-finalize never double-counts
+        if (activeBout.finalized) {
+          if (activeBout.finalizedSnapshot) {
+            reverseDualRecordContribution(season, activeBout);
+          } else {
+            console.warn("Re-finalize: bout was finalized without snapshot; dual record may need manual review.");
+          }
+        }
+
+        if (outcome === "win") rec.wins = (rec.wins || 0) + 1;
+        else if (outcome === "loss") rec.losses = (rec.losses || 0) + 1;
+        else rec.ties = (rec.ties || 0) + 1;
       }
 
       activeBout.finalized = true;
-      activeBout.finalizedSnapshot = { ourPts: Number(ourPts) || 0, oppPts: Number(oppPts) || 0, outcome, at: Date.now() };
+      activeBout.finalizedSnapshot = {
+        ourPts: our,
+        oppPts: opp,
+        outcome: outcome,
+        at: Date.now(),
+        eventType: activeBout.type || "",
+        dualRecordUpdated: isDual
+      };
       persist();
-      toast(`Dual Meet Finalized (${outcome.toUpperCase()} ${ourPts}-${oppPts}). Season dual record updated.`);
+      if (isDual) {
+        toast("Finalized (" + outcome.toUpperCase() + " " + our + "-" + opp + "). Season dual record updated. Scoring locked.");
+      } else {
+        toast("Finalized " + eventLabel + ". Scoring is locked until you Reopen.");
+      }
       render();
     }
 
     function reopenDualMeet() {
-      if (guardSeasonLocked("reopening dual meets")) return;
+      if (guardSeasonLocked("reopening events")) return;
       const season = getActiveSeason();
       const activeBout = getActiveBout();
-      if (!activeBout || activeBout.type !== "Dual") return;
-      if (!activeBout.finalized) return toast("This dual is not finalized.");
-      if (!confirm("Reopen this dual meet?\n\nThis will reverse its contribution to the season dual record so you can edit matches and re-finalize later.")) return;
-      reverseDualRecordContribution(season, activeBout);
+      if (!activeBout || !store.activeBoutId || store.activeBoutId === "all") return;
+      if (!activeBout.finalized) return toast("This event is not finalized.");
+      const isDual = activeBout.type === "Dual";
+      const msg = isDual
+        ? "Reopen this dual meet?\n\nThis will reverse its contribution to the season dual record so you can edit matches and re-finalize later."
+        : "Reopen this event?\n\nYou can score or edit again, then Finalize when ready.";
+      if (!confirm(msg)) return;
+      if (isDual) {
+        reverseDualRecordContribution(season, activeBout);
+      }
       activeBout.finalized = false;
       activeBout.finalizedSnapshot = null;
       persist();
-      toast("Dual meet reopened. You can score or edit matches and finalize again when ready.");
+      toast(isDual ? "Dual reopened. You can score or edit and finalize again when ready." : "Event reopened. You can score or edit and finalize again when ready.");
       render();
     }
 
@@ -14194,7 +14427,7 @@ function computeRawStatsBundle(wrestlerId) {
                 <button type="button" class="btn" style="padding:4px 10px; font-size:10px; font-weight:800; background:${statsViewMode === 'efficiency' ? 'var(--gold)' : 'var(--panelLine)'}; color:${statsViewMode === 'efficiency' ? 'var(--mat)' : 'var(--chalk)'};"
                   onclick="statsViewMode='efficiency'; render();">Efficiency</button>
                 <button type="button" class="btn" style="padding:4px 10px; font-size:10px; font-weight:800; background:${statsViewMode === 'raw' ? 'var(--gold)' : 'var(--panelLine)'}; color:${statsViewMode === 'raw' ? 'var(--mat)' : 'var(--chalk)'};"
-                  onclick="statsViewMode='raw'; render();">Stats</button>
+                  onclick="statsViewMode='raw'; render();">Stats</button> ${helpIcon('stats_raw')}
                 <button type="button" class="btn btn-gold" style="padding:4px 10px; font-size:10px;" onclick="printStatsPage()">Print</button>
               </span>
             </div>
@@ -16871,9 +17104,8 @@ function computeRawStatsBundle(wrestlerId) {
             <input class="input" value="${swEsc(branding.teamName)}" oninput="branding.teamName = this.value; persist(); applyBranding(branding);" placeholder="e.g. Scorpions Wrestling" />
           </div>
           <div>
-            <label class="field-label">Home Location</label>
+            <label class="fld-label">Home Location ${helpIcon('admin_home_location')}</label>
             <input class="input" value="${swEsc(branding.homeLocation || '')}" oninput="branding.homeLocation = this.value; persist();" placeholder="e.g. Main gym, Desert Ridge HS" />
-            ${helpIcon('admin_home_location')}
           </div>
           <div>
             <label class="fld-label">Team Text Color</label>
@@ -16891,10 +17123,7 @@ function computeRawStatsBundle(wrestlerId) {
           </div>
         </div>
         <div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--panelLine);">
-          <div class="sec-label">Header Banner (full width)</div>
-          <p style="font-size:10px; color:var(--muted); margin:0 0 10px 0;">
-            One banner across the top of the app (about <strong>156 px</strong> tall). Design at <strong>~1280 × 312 px</strong> (or similar ~4:1). PNG recommended. License status overlays the bottom-right corner. Optional logo overlays the left side.
-          </p>
+          <div class="sec-label">Header Banner (full width) ${helpIcon('admin_banner')}</div>
           <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:6px;">
             <label class="btn" style="padding:6px 10px; font-size:11px; cursor:pointer; background:var(--panelLine); color:var(--chalk); margin:0;">
               Upload Banner
@@ -16908,10 +17137,7 @@ function computeRawStatsBundle(wrestlerId) {
               : `<span style="font-size:10px; color:var(--muted);">Default Banner or Custom</span>`}
           </div>
           <div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--panelLine);">
-            <div class="sec-label">Logo Overlay (left side)</div>
-            <p style="font-size:10px; color:var(--muted); margin:0 0 10px 0;">
-              Sits on top of the banner on the left. PNG with transparent background recommended. Square or portrait logos work best.
-            </p>
+            <div class="sec-label">Logo Overlay (left side) ${helpIcon('admin_logo')}</div>
             <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:6px;">
               <label class="btn" style="padding:6px 10px; font-size:11px; cursor:pointer; background:var(--panelLine); color:var(--chalk); margin:0;">
                 Upload Logo
@@ -16927,10 +17153,9 @@ function computeRawStatsBundle(wrestlerId) {
           </div>
         </div>
         <div style="margin-top:10px;">
-          <label class="fld-label">Default Singlet Color (for wrestler ID)</label>
+          <label class="fld-label">Default Singlet Color (for wrestler ID) ${helpIcon('admin_singlet')}</label>
           <input class="input" placeholder="e.g. navy, black / gold" value="${(ourWrestlerAppearance.singletColor || "").replace(/"/g, "&quot;")}"
             oninput="ourWrestlerAppearance.singletColor = this.value; persist();" />
-          <p style="font-size:10px; color:var(--muted); margin:4px 0 0 0;">Used as the default primary singlet color when identifying your wrestler on the Scout page.</p>
         </div>
         `;
 
@@ -17822,9 +18047,6 @@ const aiBody = `
           ${adminSectionBlock('branding', 'Team Name & Branding', brandingBody + `
             <div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--panelLine);">
               <div class="sec-label" style="margin-bottom:6px;">Division pronouns</div>
-              <p style="font-size:11px; color:var(--muted); margin:0 0 8px 0;">
-                Labels across the app (records, filters, forms). Data still stores Boys/Girls internally.
-              </p>
               <label style="display:flex; align-items:flex-start; gap:8px; margin-bottom:6px; font-size:12px; cursor:pointer;">
                 <input type="radio" name="division-pronouns" style="margin-top:3px;"
                   ${(appConfig.divisionPronouns || "boysGirls") !== "menWomen" ? "checked" : ""}
@@ -18502,6 +18724,10 @@ const aiBody = `
                 <option value="bug" selected>Bug</option>
                 <option value="feature">Feature request</option>
               </select>
+              <label class="field-label">Your name</label>
+              <input id="bug-report-name" class="input" placeholder="First and last name" style="margin-bottom:8px;" />
+              <label class="field-label">Gmail</label>
+              <input id="bug-report-email" class="input" type="email" placeholder="you@gmail.com" style="margin-bottom:8px;" />
               <label class="field-label">Short title</label>
               <input id="bug-report-title" class="input" placeholder="e.g. Save to Drive fails — or: Add export to PDF" />
               <label class="field-label">Details</label>
@@ -19077,7 +19303,7 @@ const aiBody = `
         root.innerHTML = `
           <div class="modal-overlay">
             <div class="modal-box" onclick="event.stopPropagation()">
-              <div class="card-title">Create Bout / Event ${helpIcon('roster_events')}</div>
+              <div class="card-title">Create Bout / Event ${helpIcon('roster_events_create')}</div>
               <div class="grid-3" style="margin-bottom:8px;">
                 <div>
                   <label style="font-size:11px; color:var(--muted);">Event Date</label>
@@ -20859,7 +21085,7 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
     }
 
     // Build stamp for coaches comparing downloads
-    const MAT_SCOUT_BUILD = "2026-09-18-banner-theme";
+    const MAT_SCOUT_BUILD = "2026-10-31-login-gate";
 
     /* HARDENING V2 — non-blocking notifications, collision-safe IDs, and one-step undo. */
     let idFallbackCounter = 0;
@@ -22034,20 +22260,30 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         try { toast("Enter a short title or description.", "error"); } catch (e) {}
         return;
       }
+      const nameEl = document.getElementById("bug-report-name");
+      const emailEl = document.getElementById("bug-report-email");
+      const reporterName = ((nameEl && nameEl.value) || "").trim();
+      const reporterEmail = ((emailEl && emailEl.value) || "").trim();
       const btn = document.querySelector("#bug-report-submit-btn");
       if (btn) { btn.disabled = true; btn.textContent = "Submitting…"; }
       const build = (typeof MAT_SCOUT_BUILD !== "undefined") ? MAT_SCOUT_BUILD : "";
-      const email = (typeof googleUserEmail === "string" && googleUserEmail) ? googleUserEmail : "";
+      const email = reporterEmail || ((typeof googleUserEmail === "string" && googleUserEmail) ? googleUserEmail : "");
       const lic = (typeof ensureLicenseState === "function") ? ensureLicenseState() : null;
+      const bodyWithContact =
+        (reporterName || reporterEmail
+          ? ("Reporter: " + (reporterName || "(no name)") + " <" + (reporterEmail || "no email") + ">\n\n")
+          : "") +
+        (body || "(no description)");
       const payload = {
         title: title || (product + " " + (reportType === "feature" ? "feature request" : "bug report")),
-        body: body || "(no description)",
+        body: bodyWithContact,
         reportType: reportType,
         label: githubLabel,
         product: product,
         build: build,
         url: (typeof location !== "undefined" ? location.href : ""),
         userAgent: (typeof navigator !== "undefined" ? navigator.userAgent : ""),
+        reporterName: reporterName || "",
         googleEmail: email || "",
         license: lic && lic.activated ? (lic.licensedEmail || "activated") : "trial/not activated",
         saveTarget: (appConfig && appConfig.downloadTarget) || "drive",
@@ -23354,191 +23590,51 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
     const MAT_SCOUT_CHANGELOG = [
       {
+        build: "2026-10-31-login-gate",
+        items: [
+          "Login screen: Coaches (PIN + Google Drive) and Wrestlers (Google Drive) entry paths",
+          "Placeholder Strategic Wrestler logo on login; coach vs wrestler page access after sign-in"
+        ]
+      },
+      {
+        build: "2026-10-29-finalize-all-events",
+        items: [
+          "Finalize locks duals, tournaments, and other events; dual W–L–T updates only for Dual meets",
+          "Reopen unlocks any finalized event; dual record reversed only for duals"
+        ]
+      },
+      {
+        build: "2026-10-28-help-clip-autoconnect",
+        items: [
+          "Clip server auto-connects on startup; Admin status reflects connection without manual Test",
+          "Updated help text: roster, events, riding time, bout sheet, Hall of Fame, Record Book, raw stats",
+          "Bug/feature report form includes name and Gmail fields",
+          "Changelog limited to the five most recent builds"
+        ]
+      },
+      {
         build: "2026-10-25-ai-highlight-reel",
         items: [
           "Create Highlight Reel uses Gemini + popup prompts for edit plan",
           "Event dropdown shows schedule duals/tournaments with date · name · type · division"
         ]
       },
-
       {
         build: "2026-10-25-role-share-highlights-v2",
         items: [
           "Role from Google email lists (no coach/wrestler startup popup)",
           "Drive share: fixed permissions API; Shared with me guidance",
-          "Highlights: Selected Clips, Clear Clips, MatScorer-style names, wrestler subfolders, mp4 via clip server"
+          "Highlights: Selected Clips, Clear Clips, MatScorer-style names, wrestler subfolders"
         ]
       },
-
       {
         build: "2026-10-25-highlights-root-share-fix",
         items: [
-          "Highlight Clips/Reels under Strategic Wrestler root (not Backups); Save reel after review",
+          "Highlight Clips/Reels under Strategic Wrestler root (not Backups)",
           "Highlights: Load Video, View Reel, remove reels; clip markers sync to Drive",
-          "Share coaches: verify folder ids (fixes 404 stale root); top-bar font larger, same height"
+          "Share coaches: verify folder ids; top-bar font larger"
         ]
-      },
-
-      {
-        build: "2026-10-25-topbar-highlights-stats",
-        items: [
-          "Top bar shorter; Export MatScorer left of Drive Sync",
-          "Highlights: Remove Video, speeds, Clip Highlight, keyboard seek/play",
-          "Stats layout: choice labels, scored-on avg against cards, raw column balance",
-          "Forgot coach PIN: reset via license from Unlock Coach prompt"
-        ]
-      },
-
-      {
-        build: "2026-10-25-wrestler-mode-fixes",
-        items: [
-          "Wrestler mode: Unlock Coach (PIN) always available in the role bar",
-          "Hide blocked tabs on load; calendar view-only (no attendance/event edits)"
-        ]
-      },
-
-      {
-        build: "2026-10-25-wrestler-highlight-folder-share",
-        items: [
-          "Wrestler Drive share: Viewer on team data; optional Editor only on Highlight Clips & Highlight Reels"
-        ]
-      },
-
-      {
-        build: "2026-10-25-coach-pin-wrestler-emails",
-        items: [
-          "Coach PIN required for coach mode; wrestlers continue without a PIN",
-          "Admin: share Drive folders with coach emails (Editor) and wrestler emails (Viewer, unlimited)",
-          "PIN reset available when team license is active on the device"
-        ]
-      },
-
-      {
-        build: "2026-10-25-coach-share-wrestler",
-        items: [
-          "Admin: share Strategic Wrestler Google Drive folders with coach emails (Editor/Viewer)",
-          "Wrestler mode: access code, limited pages, Load/print only; optional Highlights"
-        ]
-      },
-
-      {
-        build: "2026-10-24-ui-polish",
-        items: [
-          "Highlight Clips/Reels auto-created on Drive and local SW folder; no silent Google OAuth on start (in-app Connect only)",
-          "Clip Highlight beside playback speeds; +1 RT auto for college (checkbox removed)",
-          "Avg points for/against per period on Efficiency, Leaderboard Scored On, and raw Stats; position choice colors gold/white"
-        ]
-      },
-
-      {
-        build: "2026-10-23-highlights-page",
-        items: [
-          "Scout: Clip Highlight moved into Score Match title row after weight class",
-          "New Highlights page (after Calendar): Create Highlight Reel, viewer, wrestler clip/reel counts",
-          "Stats: Avg Points per Period moved below Riding Time"
-        ]
-      },
-
-      {
-        build: "2026-10-20-period-highlights",
-        items: [
-          "Efficiency: Avg Points per Period (P1–P3) block before Riding Time; Leaderboard Avg Pts / Period 1–3",
-          "Scout Clip Highlight + Roster Create Highlight reel job (folders Highlight Clips / Highlight Reels); full AI video render needs local clip server"
-        ]
-      },
-
-      {
-        build: "2026-10-18-supabase-trial",
-        items: [
-          "90-day trial synced to Supabase (trials table) by device id and Google email — clearing browser data no longer resets trial when the same account/device reconnects",
-          "Connect Google Drive to bind trial to email; trial status still works offline using last synced start date"
-        ]
-      },
-
-      {
-        build: "2026-10-18-idle-autosave",
-        items: [
-          "Record Book: optional Include Exh checkbox (Varsity/starters still required; exhibition matches count when on)",
-          "Auto-save runs once after 30 minutes of no user activity (not on a 15-minute active timer)",
-          "Printed schedule holidays default off; when on, only holidays in Calendar month tabs (or bout/custom months)"
-        ]
-      },
-
-      {
-        build: "2026-10-18-record-book-persist",
-        items: [
-          "Record Book: Single Season = best Varsity single-season marks across all years (records carry forward); Career = Varsity career totals",
-          "Record Book: Boys / Girls / All filter; top 3 expand to top 10; persisted + included in top-bar Save",
-          "Auto-save every 15 min while you are the editor and actively using the tab; auto-load latest Drive/local backup on open",
-          "When editor seat switches to you, auto-load the most recent backup (connects Drive if needed)",
-          "Presence still heartbeats hourly while the tab is open; idle is tracked separately for auto-save (30 min no input)"
-        ]
-      },
-
-      {
-        build: "2026-10-17-record-book",
-        items: [
-          "Stats: Record Book next to Hall of Fame — weight-class W/L and scoring records (Takedowns, Near Falls, Reversals, Escapes, Pins, Tech Falls)",
-          "Record Book shows top 3; click a section to expand to top 10; Single Season / Career toggle",
-          "Career ranks use every season stored in the program and print per scope; included in full Save backup snapshot",
-          "Print Schedule: holidays and same-day custom entries combine (e.g. Christmas Day, No Practice)",
-          "Calendar Print Schedule matches Roster Print Schedule"
-        ]
-      },
-
-      {
-        build: "2026-10-12-schedule-branding",
-        items: [
-          "Google Drive G-badge connect: OAuth Client ID is built-in (no paste field)",
-          "Admin Team setup: Home Location auto-fills Location on Home bouts/events",
-          "Print Schedule: same-day duals at the same site combine (e.g. @ Big Bear w/ Eastside); Boys+Girls still merge to Both",
-          "Men/Women pronouns applied on bout dropdowns and printouts; College levels auto-select Men/Women",
-          "Top bar Save includes AI Training Plans (plus seasons, roster, matches, calendar, awards, gear, Admin, opponent memory, AI library)",
-          "Export for MatScorer label; MatScorer package compatibility",
-          "Tutorial and Diagnostics updated for Drive, MatScorer, schedule, and backup coverage"
-        ]
-      },
-
-      {
-        build: "2026-10-11-clip-drive-sync",
-        items: [
-          "Auto-Clip: Connect / Disconnect / status pill (localhost:5057); URL field removed",
-          "Clip Connect shows install help (pip install flask flask-cors + ffmpeg) when the server is missing",
-          "Clips respect Save location — local AI Library/Clips, and mirror to Drive AI Library when Drive is selected",
-          "AI Training Library: Send library to clipper (replaces Export for Kaggle for the clipper workflow)",
-          "Top bar: Drive Sync uploads local Strategic Wrestler folders to matching Google Drive folders",
-          "Backup retention: keep the last 5 Save files (not 5 calendar days)",
-          "Presence view-only lock for second coaches; MatScorer weight-class transfer from SW export"
-        ]
-      },
-      {
-        build: "2026-09-18-banner-theme",
-        items: [
-          "New default banner installed; the old placeholder banner is fully removed from the app",
-          "Admin: Revert to Default Banner button",
-          "Top bar reorganized — line 1 is team name, dual record, style, Load, Save; line 2 is Season and Event",
-          "Admin Team Setup: create and delete custom roster flags, togglable per-athlete on Edit Athlete and shown on the roster",
-          "Custom Awards: Tournament / Weekly / Monthly / Annual / Special category, awards list now in 3 columns",
-          "Roster: Create Season, Add Bout/Event, and Add Wrestler are green",
-          "Scout: Start Scoring Match and Analyze Match are green; Discard Match is red",
-          "Riding time redesigned — state and icon on the Our RT / Opp RT buttons; manual +1 RT and help icon",
-          "Accent Gold now only recolors headings — buttons and badges keep fixed gold",
-          "Admin: auto color-match theme to the banner; rotate color scheme through the banner palette"
-        ]
-      },
-      {
-        build: "2026-09-17-fall-times",
-        items: [
-          "Scoring a pin prompts for fall time; tech margin prompts for tech fall time",
-          "Tech fall times stored per match and editable on the Bout Sheet",
-          "Fall time editing moved to an in-app dialog",
-          "Hall of Fame headers color-coded to the ruleset chip",
-          "Scout and AI Scout: Match Level, Select Opponent from Event Roster, Custom Opponent Name",
-          "Training Plan modifiers relabeled Our Ties and Opponent Ties",
-          "Calendar help corrected for combined Boys/Girls events"
-        ]
-      },
-    
+      }
     ];
     const LAST_SEEN_BUILD_KEY = "mat-scout-last-seen-build";
     try {
@@ -23787,6 +23883,13 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       try { restoreAiTrainingPlanFromStorage(); } catch (e) {}
       maybeShowChangelogOnBoot();
       try { bindRidingTimeVideoListeners(); } catch (e) {}
+      try {
+        if (typeof loginGatePassed === "function" && !loginGatePassed()) {
+          showLoginGate();
+        } else {
+          hideLoginGate();
+        }
+      } catch (e) {}
     };
 
   </script>
