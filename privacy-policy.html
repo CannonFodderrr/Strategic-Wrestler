@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Privacy Policy — Strategic Wrestler</title>
+  <style>
+    :root {
+      --bg: #1c1f1e;
+      --card: #25292a;
+      --text: #f2f0ea;
+      --muted: #9aa19f;
+      --gold: #d9a441;
+      --line: #33383a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .wrap {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    h1 {
+      font-size: 1.75rem;
+      color: var(--gold);
+      margin: 0 0 8px;
+    }
+    h2 {
+      font-size: 1.15rem;
+      color: var(--gold);
+      margin: 28px 0 10px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 6px;
+    }
+    p, li { color: var(--text); }
+    .meta { color: var(--muted); font-size: 0.95rem; margin-bottom: 24px; }
+    ul { padding-left: 1.25rem; }
+    li { margin: 6px 0; }
+    a { color: var(--gold); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin: 16px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Privacy Policy</h1>
+    <p class="meta">
+      <strong>Strategic Wrestler</strong> and companion app <strong>MatScorer</strong><br />
+      Effective date: November 2, 2026<br />
+      Last updated: November 3, 2026<br />
+      App / source:
+      <a href="https://github.com/CannonFodderrr/Strategic-Wrestler" target="_blank" rel="noopener">github.com/CannonFodderrr/Strategic-Wrestler</a><br />
+      Hosted app (GitHub Pages):
+      <a href="https://cannonfodderrr.github.io/Strategic-Wrestler/" target="_blank" rel="noopener">cannonfodderrr.github.io/Strategic-Wrestler/</a>
+    </p>
+
+    <div class="card">
+      <p style="margin:0;">
+        This Privacy Policy explains how Strategic Wrestler (“SW,” “we,” “us”) handles information when
+        coaches, staff, and athletes use the Strategic Wrestler web application and the companion
+        MatScorer scoring app (together, the “Apps”).
+      </p>
+    </div>
+
+    <h2>1. Who this applies to</h2>
+    <p>
+      The Apps are intended for wrestling coaches, team staff, and (where enabled) athletes or families
+      viewing team information. Schools and clubs remain responsible for obtaining any permissions
+      required to enter minor athletes’ information under applicable school, state, and national rules.
+    </p>
+
+    <h2>2. What the Apps do</h2>
+    <p>Strategic Wrestler helps teams manage roster, schedule, stats, bout sheets, scouting, training tools, and related team records. MatScorer is used for live dual/event scoring and related match files. Optional cloud features use Google Sign-In and Google Drive (with limited scope) and a backend service for licensing and multi-user coordination.</p>
+
+    <h2>3. Information we process</h2>
+    <p>Depending on how you use the Apps, the following categories may be processed:</p>
+    <ul>
+      <li><strong>Account and access data</strong> — Google account email used to sign in to Google Drive; license or trial status; role (for example coach or wrestler mode).</li>
+      <li><strong>Team and athlete data you enter</strong> — names, grades/levels, weight classes, contact fields you choose to store, attendance, gear, stats, match results, notes, and similar team records.</li>
+      <li><strong>Event and media files you create</strong> — match JSON, videos, backups, highlight clips/reels, and exports stored where you choose (device storage and/or Google Drive folders used by the Apps).</li>
+      <li><strong>Device and technical data</strong> — browser local storage / IndexedDB for settings and offline-capable saves; basic diagnostic information in your browser console if errors occur.</li>
+      <li><strong>Presence / session signals</strong> — limited “who is actively editing” style heartbeats so the team avoids conflicting edits (when that feature is enabled).</li>
+    </ul>
+    <p>We do not require payment-card entry inside the Apps for ordinary coaching use. License fulfillment may be handled separately by the operator.</p>
+
+    <h2>4. Google Sign-In and Google Drive</h2>
+    <p>
+      When you connect Google Drive, the Apps request the OAuth scope
+      <code>https://www.googleapis.com/auth/drive.file</code>.
+      That scope allows the Apps to create, read, update, and share <strong>only</strong> Google Drive
+      files and folders that the Apps create or that you explicitly open/select with the Apps
+      (for example a “Strategic Wrestler” team folder). The Apps are <strong>not</strong> designed to
+      request full access to your entire Google Drive.
+    </p>
+    <ul>
+      <li>Drive content (rosters exports, backups, MatScorer match files, etc.) stays in <strong>your</strong> Google account’s Drive (and with people you share those folders with).</li>
+      <li>Access tokens are handled in the browser session to call Google’s APIs; they are not used to sell personal data.</li>
+      <li>You may revoke access at any time in your Google Account under Security → Third-party access / app access.</li>
+    </ul>
+    <p>
+      Google’s own processing is described in the
+      <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google Privacy Policy</a>.
+    </p>
+
+    <h2>5. Supabase (licensing and coordination)</h2>
+    <p>
+      The Apps may use a hosted backend (Supabase) operated for Strategic Wrestler to support
+      features such as license/trial validation and multi-user presence (for example, who currently
+      holds edit rights). This typically involves identifiers such as email or license-related keys
+      and session timestamps—not your full team film library.
+    </p>
+    <p>
+      Infrastructure providers process data under their own terms. See
+      <a href="https://supabase.com/privacy" target="_blank" rel="noopener">Supabase Privacy Policy</a>.
+    </p>
+
+    <h2>6. Where data is stored</h2>
+    <ul>
+      <li><strong>On your device / browser</strong> — settings, cached season data, and local folder links may be stored using browser storage (including localStorage and IndexedDB) so the Apps can work across sessions.</li>
+      <li><strong>On your Google Drive</strong> — when connected, backups and team files are written under team folders such as Strategic Wrestler (and related subfolders used by SW/MatScorer).</li>
+      <li><strong>On licensing/presence servers</strong> — limited account and session coordination data as described above.</li>
+    </ul>
+    <p>Because much team content lives in your Drive and browser storage, <strong>you control retention</strong> of those files by keeping, exporting, or deleting them.</p>
+
+    <h2>7. How we use information</h2>
+    <ul>
+      <li>Provide coaching features (roster, stats, schedule, scoring, imports/exports).</li>
+      <li>Save and restore team data to locations you choose.</li>
+      <li>Authenticate Google Drive access you authorize.</li>
+      <li>Validate licenses/trials and reduce conflicting simultaneous edits.</li>
+      <li>Improve reliability and fix errors.</li>
+    </ul>
+    <p><strong>We do not sell your personal information.</strong> We do not use Google user data for advertising. We do not use Drive content to train third-party advertising models.</p>
+
+    <h2>8. Sharing</h2>
+    <ul>
+      <li><strong>Team sharing you initiate</strong> — coaches may share Drive folders with other coaches or staff; wrestler/viewer modes may allow limited read access depending on configuration.</li>
+      <li><strong>Service providers</strong> — Google (Sign-In / Drive APIs) and Supabase (licensing/presence infrastructure).</li>
+      <li><strong>Legal</strong> — if required by law or to protect safety, rights, or integrity of the service.</li>
+    </ul>
+    <p>Other coaches or schools you share data with are independent handlers of whatever you send them.</p>
+
+    <h2>9. Children’s and student information</h2>
+    <p>
+      The Apps may store information about student-athletes, including minors, when a coach or school
+      enters it. Strategic Wrestler is directed at coaches and institutions, not at children as primary
+      operators. Coaches and schools should enter only information they are authorized to maintain and
+      should configure sharing carefully (especially athlete-facing access).
+    </p>
+
+    <h2>10. Security</h2>
+    <p>
+      We use industry-standard transport security (HTTPS) for hosted pages and API calls. Access to
+      Drive data requires your Google authorization. No method of transmission or storage is 100%
+      secure; protect your Google account with a strong password and two-factor authentication, and
+      limit folder sharing to trusted staff.
+    </p>
+
+    <h2>11. Your choices</h2>
+    <ul>
+      <li>Disconnect Google Drive from the Apps and/or revoke access in your Google Account.</li>
+      <li>Delete team files from Google Drive and clear site data in your browser.</li>
+      <li>Request license-related account questions via the contact email below.</li>
+      <li>Stop using the Apps at any time.</li>
+    </ul>
+
+    <h2>12. International users</h2>
+    <p>
+      The Apps may be accessed from different locations. Providers such as Google and Supabase may
+      process data in the United States or other countries. If you use the Apps from outside your home
+      country, you understand that information may be transferred to those locations.
+    </p>
+
+    <h2>13. Changes to this policy</h2>
+    <p>
+      We may update this Privacy Policy as the Apps evolve. The “Last updated” date at the top will
+      change when we do. Continued use after an update means you acknowledge the revised policy.
+    </p>
+
+    <h2>14. Contact</h2>
+    <p>
+      For privacy questions related to Strategic Wrestler or MatScorer, contact:<br />
+      <strong>Email:</strong> <a href="mailto:Timothy.d.seidlitz@gmail.com">Timothy.d.seidlitz@gmail.com</a><br />
+      <strong>App:</strong> Strategic Wrestler<br />
+      <strong>GitHub:</strong> <a href="https://github.com/CannonFodderrr/Strategic-Wrestler" target="_blank" rel="noopener">CannonFodderrr/Strategic-Wrestler</a>
+    </p>
+  </div>
+</body>
+</html>
