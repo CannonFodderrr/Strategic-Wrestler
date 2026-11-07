@@ -4,8 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Strategic Wrestler — Wrestling Analytics & Match Manager</title>
-  <!-- YouTube IFrame API -->
-  <script src="https://www.youtube.com/iframe_api"></script>
+  <!-- YouTube IFrame API is loaded on demand (ensureYouTubeApi) so it can never block app start-up -->
   <!-- Google Identity + API client (Drive Save/Load) -->
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="https://apis.google.com/js/api.js" async defer></script>
@@ -589,6 +588,10 @@
 
   <div id="modal-root"></div>
   <canvas id="frame-canvas" style="display:none;"></canvas>
+  <div id="sw-boot-status" role="status" style="position:fixed;inset:0;z-index:99998;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;background:#1C1F1E;color:#F2F0EA;font-family:system-ui,sans-serif;text-align:center;padding:24px;">
+    <div style="font-size:18px;font-weight:800;color:#D9A441;">Strategic Wrestler</div>
+    <div id="sw-boot-msg" style="font-size:13px;color:#8B9290;">Opening your data…</div>
+  </div>
 
   <script>
     // Safely embed a dynamic string inside `onclick="fn('${value}')"` markup.
@@ -652,6 +655,7 @@
       const dirty = new Set();
       let db = null, mode = "pending", flushTimer = null, flushing = null, flushAgain = false;
       let lastSnapshotAt = 0, stale = false, lastError = "", lastSavedAt = 0, errorToastShown = false;
+      let flushRetryTimer = null, flushRetries = 0;
       const cache = { usage: 0, quota: 0, persisted: null, snapshots: [] };
       const TAB_ID = Math.random().toString(36).slice(2);
       let chan = null;
@@ -753,7 +757,7 @@
             batch.forEach(([k, v]) => { if (v === undefined) st.delete(k); else st.put(v, k); });
             await txDone(tx);
             batch.forEach(([k, v]) => { if (mem.get(k) === v) dirty.delete(k); });
-            lastSavedAt = Date.now(); errorToastShown = false;
+            lastSavedAt = Date.now(); errorToastShown = false; flushRetries = 0;
             if (chan) { try { chan.postMessage({ tab: TAB_ID, t: lastSavedAt }); } catch (e) {} }
             if (Date.now() - lastSnapshotAt > AUTO_SNAPSHOT_MS) snapshot("Automatic", false).catch(() => {});
             return true;
@@ -764,6 +768,11 @@
               errorToastShown = true;
               say(quota ? "Browser storage is full — changes are NOT being saved. Download a full backup now and free space."
                         : "Could not save to browser storage (" + lastError + "). Download a full backup to be safe.");
+            }
+            // Keep the data marked dirty and retry (a transient failure used to leave it unsaved until the next edit)
+            if (!flushRetryTimer && !quota && flushRetries < 5) {
+              flushRetries++;
+              flushRetryTimer = setTimeout(() => { flushRetryTimer = null; flush(); }, 3000 * flushRetries);
             }
             return false;
           } finally {
@@ -976,11 +985,6 @@
       return "Folkstyle";
     }
 
-    function defaultPresetKeyForStyle(style) {
-      const st = style || "Folkstyle";
-      if (st === "Freestyle" || st === "Greco") return "uww_senior";
-      return "nfhs_14";
-    }
 
     function loadWeightClassPreset(key, silent) {
       const preset = WEIGHT_CLASS_PRESETS[key];
@@ -1294,33 +1298,6 @@
       return 0;
     }
 
-    /** Lightweight self-check used after taxonomy edits / in Admin diagnostics. */
-    function assertPointResolutionSanity() {
-      const cases = [
-        ["Escape", "Switch", "Folkstyle", 1],
-        ["Reversal", "Switch", "Folkstyle", 2],
-        ["Takedown", "Double Leg", "Folkstyle", 3],
-        ["Takedown", "Double Leg", "Freestyle", 2],
-        ["Near Fall / Pin", "4-Point NF", "Folkstyle", 4],
-        ["Exposure / Pin", "4-Point Exposure", "Freestyle", 4],
-        ["Takedown", "Custom Brand New Shot", "Folkstyle", 3]
-      ];
-      const prevStyle = (getActiveSeason() && getActiveSeason().style) || "Folkstyle";
-      const issues = [];
-      cases.forEach(([cat, move, style, expect]) => {
-        try {
-          const s = getActiveSeason();
-          if (s) s.style = style;
-          const got = getPointValue(cat, move);
-          if (got !== expect) issues.push(`${cat}/${move}/${style}: got ${got}, expected ${expect}`);
-        } catch (err) {
-          issues.push(String(err.message || err));
-        }
-      });
-      const s = getActiveSeason();
-      if (s) s.style = prevStyle;
-      return issues;
-    }
 
     function isPenaltyCategory(cat) {
       return cat === "Penalty" || cat === "Penalty/DQ";
@@ -1641,25 +1618,6 @@
       } catch (e) {}
     }
 
-    function getRidingTimeStatusHtml() {
-      if (getSeasonStyle() !== "Folkstyle") return "";
-      const holdBlocked = ridingTimeHoldUntilSec != null && getVideoCurrentTimeSec() + 0.05 < ridingTimeHoldUntilSec;
-      if (holdBlocked && ridingTimeController) {
-        return `<span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:3px; background:var(--panelLine); color:var(--muted); border:1px solid var(--muted);">RT ⏭ HOLD (${ridingTimeController === "our" ? "Our" : "Opp"})</span>`;
-      }
-      if (ridingTimeManualPaused && ridingTimeController) {
-        return `<span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:3px; background:var(--panelLine); color:var(--muted); border:1px solid var(--muted);">RT ❚❚ PAUSED (${ridingTimeController === "our" ? "Our" : "Opp"})</span>`;
-      }
-      if (ridingTimeActive && ridingTimeController && isVideoPlaying()) {
-        const col = ridingTimeController === "our" ? "var(--green)" : "var(--red)";
-        const bg = ridingTimeController === "our" ? "var(--greenDim)" : "var(--redDim)";
-        return `<span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:3px; background:${swEsc(bg)}; color:${swEsc(col)}; border:1px solid ${swEsc(col)};">RT ▶ ${ridingTimeController === "our" ? "OUR" : "OPP"}</span>`;
-      }
-      if (ridingTimeController && !ridingTimeActive) {
-        return `<span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:3px; background:var(--panelLine); color:var(--muted); border:1px solid var(--muted);">RT ❚❚ (${ridingTimeController === "our" ? "Our" : "Opp"} ready)</span>`;
-      }
-      return `<span style="font-size:9px; font-weight:800; padding:2px 6px; border-radius:3px; background:var(--mat); color:var(--muted); border:1px solid var(--panelLine);">RT —</span>`;
-    }
 
     function closeRidingTimeSegmentAt(endSec, clearController) {
       if (!activeMatch || !ridingTimeController || ridingTimeStartSec == null) {
@@ -1896,10 +1854,6 @@
       toast("Riding time +1 awarded (" + (direction === "offense" ? "us" : "opponent") + ").", "success");
     }
 
-    /** No longer auto-adds RT points — kept as no-op for any remaining callers. */
-    function applyRidingTimePointIfNeeded() {
-      // Intentionally empty: RT +1 is manual via awardRidingTimePoint()
-    }
 
     /** Hook position choices → RT (Top=our, Bottom=opp, Neutral=stop). */
     function applyRidingTimeFromPositionChoice(pos) {
@@ -2407,6 +2361,7 @@
     let aiTrainingPlanResult = null;
     let aiTrainingPlanCache = {}; // subjectKey -> { html, generatedAt, plan } // { html, generatedAt, raw } | null
     let aiTrainingPlanLoading = false;
+    let aiTrainingPlanLoadingSubject = null;
     let aiTrainingPlanError = null;
     let activeProficiencyDetail = null;
     let activeHelpTopic = null;
@@ -2454,8 +2409,29 @@
     let draggedCardEl = null;
     let videoCardEl = null;
 
+    let _ytApiCallbacks = [];
+    let _ytApiRequested = false;
     function onYouTubeIframeAPIReady() {
       ytApiReady = true;
+      const cbs = _ytApiCallbacks; _ytApiCallbacks = [];
+      cbs.forEach(function (cb) { try { cb(); } catch (e) { console.warn("YT ready callback", e); } });
+    }
+    /** Load the YouTube IFrame API only when a YouTube video is actually used; run cb once it is ready. */
+    function ensureYouTubeApi(cb) {
+      if (window.YT && window.YT.Player) { if (cb) cb(); return; }
+      if (cb) _ytApiCallbacks.push(cb);
+      if (_ytApiRequested) return;
+      _ytApiRequested = true;
+      try {
+        const s = document.createElement("script");
+        s.src = "https://www.youtube.com/iframe_api";
+        s.async = true;
+        s.onerror = function () {
+          _ytApiRequested = false; _ytApiCallbacks = [];
+          try { toast("Could not load the YouTube player (offline?). Local video files still work.", "error", 6000); } catch (e) {}
+        };
+        document.head.appendChild(s);
+      } catch (e) { _ytApiRequested = false; }
     }
 
     function getSeasonYearLabel(season) {
@@ -3935,7 +3911,8 @@
         const isQuota = err && (err.name === "QuotaExceededError" || err.code === 22);
         if (isQuota) {
           toast("Browser storage is full. Export a full backup and archive/delete old seasons before saving again.");
-          try { exportAllBackup(); } catch (e2) {}
+          // Only auto-export ONCE per session (this branch re-runs on every save and used to download a new file each time)
+          if (!window.__swQuotaBackupDone) { window.__swQuotaBackupDone = true; try { exportAllBackup(); } catch (e2) {} }
         }
         console.warn("persist failed", err);
       }
@@ -4684,9 +4661,6 @@
       } catch (e) {}
     }
 
-    function otherCoachesActiveRecently() {
-      return Array.isArray(presenceOthers) && presenceOthers.length > 0;
-    }
 
     /** True when another coach holds the editor seat on this license. */
     /** session role: "coach" (default) or "wrestler" */
@@ -5221,8 +5195,9 @@
         } catch (e) { highlightReelsStore = []; }
         try { tryAutoConnectGoogleDrive(); } catch (e) {}
         try {
-          if (typeof connectClipServer === "function") {
-            connectClipServer().catch(function () {});
+          // Optional local clip server: only probe at start-up if the user has Auto-Clip turned on, and never show dialogs for it.
+          if (typeof connectClipServer === "function" && appConfig && appConfig.autoClipEnabled) {
+            connectClipServer({ silent: true }).catch(function () {});
           }
         } catch (e) {}
         try {
@@ -6179,6 +6154,11 @@
       const hasDomIframe = !!(targetEl.querySelector && targetEl.querySelector("iframe"));
       const needNewPlayer = !ytPlayer || !hasDomIframe;
 
+      if (needNewPlayer && !(window.YT && YT.Player)) {
+        // API not loaded yet: fetch it, then build the player (previously this silently did nothing)
+        ensureYouTubeApi(function () { initOrUpdateYouTubePlayer(videoId); });
+        return;
+      }
       if (needNewPlayer && window.YT && YT.Player) {
         // Destroy stale player reference if DOM was rebuilt
         try {
@@ -6236,6 +6216,10 @@
           if (typeof isPresenceViewOnly === "function" && isPresenceViewOnly()) return;
           // Always flush browser storage; attempt full backup to Drive/local when editor
           try { if (typeof flushStorageNow === "function") flushStorageNow(); } catch (e) {}
+          // beforeunload AND pagehide both fire on close: only start one full backup per 10 s
+          const _now = Date.now();
+          if (window.__swCloseSaveAt && _now - window.__swCloseSaveAt < 10000) return;
+          window.__swCloseSaveAt = _now;
           try {
             if (typeof saveSharedSeasonData === "function") {
               // Fire-and-forget; browsers may cancel long async work on unload
@@ -6455,12 +6439,6 @@
       openHighlightClipModal();
     }
 
-    function getActiveVideoForHotkeys() {
-      if (currentTab === "highlights") {
-        return document.getElementById("highlights-player");
-      }
-      return document.querySelector("#tab-content video, video#match-video, video");
-    }
 
     function openHighlightClipModal() {
       try {
@@ -7035,7 +7013,8 @@ function pauseVideoAndGetTime() {
       if (currentTab === "calendar") renderCalendar(container);
       if (currentTab === "highlights") renderHighlights(container);
       if (currentTab === "admin") renderAdmin(container);
-      try { setTimeout(function(){ softCheckClipServer(); }, 200); } catch (e) {}
+      // Only the Admin tab shows the clip-server pill, so only probe there (it used to fire after EVERY render, on every tab).
+      try { if (currentTab === "admin") setTimeout(function(){ softCheckClipServer(); }, 200); } catch (e) {}
 
       if (uiUnlocked && container && currentTab !== "admin") {
         const banner = document.createElement("div");
@@ -8858,9 +8837,6 @@ function pauseVideoAndGetTime() {
       return chunks.join(" ");
     }
 
-    function formatModifiersPlainFromList(list) {
-      return formatModifiersPlainFromStruct(listToModifiersStruct(list));
-    }
 
     /** Colored HTML for UI logs. Opp = red, Our = green. */
     function formatModifiersHtmlFromStruct(s) {
@@ -8985,16 +8961,6 @@ function pauseVideoAndGetTime() {
       return formatModifiersHtmlFromList(activeTieModifiers);
     }
 
-    function structToActiveList(s) {
-      const list = [];
-      (s.opp.ties || []).forEach(n => list.push({ name: n, owner: "opponent", kind: "tie" }));
-      (s.opp.finishes || []).forEach(n => list.push({ name: n, owner: "opponent", kind: "finish" }));
-      (s.opp.rides || []).forEach(n => list.push({ name: n, owner: "opponent", kind: "ride" }));
-      (s.our.ties || []).forEach(n => list.push({ name: n, owner: "wrestler", kind: "tie" }));
-      (s.our.finishes || []).forEach(n => list.push({ name: n, owner: "wrestler", kind: "finish" }));
-      (s.our.rides || []).forEach(n => list.push({ name: n, owner: "wrestler", kind: "ride" }));
-      return list;
-    }
 
 
     function snapshotOurWrestlerAppearance() {
@@ -11321,24 +11287,7 @@ function pauseVideoAndGetTime() {
       URL.revokeObjectURL(url);
     }
 
-    function downloadTextFile(filename, text, mime, purpose) {
-      if (typeof downloadOrDriveExport === "function") {
-        downloadOrDriveExport(filename, text, mime || "text/plain", purpose || "exports");
-        return;
-      }
-      const blob = new Blob([text], { type: mime || "text/plain" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = filename;
-      document.body.appendChild(a); a.click(); a.remove();
-      URL.revokeObjectURL(url);
-    }
 
-    function csvEscape(v) {
-      const s = v == null ? "" : String(v);
-      if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
-      return s;
-    }
 
     /** URL/filesystem-safe slug: lowercase, alphanumerics only, dash-separated. */
     function slugify(s) {
@@ -11514,7 +11463,8 @@ function pauseVideoAndGetTime() {
       }
     }
 
-    async function connectClipServer() {
+    async function connectClipServer(opts) {
+      const silent = !!(opts && opts.silent);
       const statusEl = document.getElementById("clip-server-status");
       if (statusEl) { statusEl.textContent = "Connecting…"; statusEl.style.color = "var(--muted)"; }
       const url = getClipServerUrl();
@@ -11536,6 +11486,7 @@ function pauseVideoAndGetTime() {
         clipServerConnected = false;
         clipServerStatusDetail = "Not reachable — start SW launcher with clip server (port 5057). " + (err.message || err);
         updateClipServerStatusUI();
+        if (silent) return false; // start-up probe: never interrupt the user about an optional local server
         const installHint =
           "Clip server not reachable at " + url + ".\n\n" +
           "Usually the SW launcher starts it automatically when dependencies are installed.\n\n" +
@@ -11572,12 +11523,14 @@ function pauseVideoAndGetTime() {
 
     
     let _clipSoftCheckInFlight = false;
+    let _clipSoftCheckLastAt = 0;
     async function softCheckClipServer() {
       if (_clipSoftCheckInFlight) return;
-      if (typeof CLIP_SERVER_URL === "undefined") return;
+      if (Date.now() - _clipSoftCheckLastAt < 30000) return; // throttle: at most one probe per 30 s
+      _clipSoftCheckLastAt = Date.now();
       _clipSoftCheckInFlight = true;
       try {
-        const url = (typeof getClipServerUrl === "function" ? getClipServerUrl() : CLIP_SERVER_URL) || "http://localhost:5057";
+        const url = (typeof getClipServerUrl === "function" ? getClipServerUrl() : "") || "http://localhost:5057";
         const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
         const t = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, 2500);
         const res = await fetch(url.replace(/\/$/, "") + "/health", {
@@ -12050,15 +12003,6 @@ async function testClipServerConnection() {
       render();
     }
 
-    function formatEventLogLine(e) {
-      const dir = e.direction === "offense" ? "US" : "OPP";
-      const od = formatOutcomeDisplay(e);
-      const pts = od.pointsHtml ? ` ${od.pointsHtml}` : "";
-      const detail = e.detail ? ` · ${e.detail}` : "";
-      const tiePlain = formatModifiersPlainForEvent(e) || e.tie || "";
-      const tie = tiePlain ? ` [${tiePlain}]` : "";
-      return `${e.period || "—"} · ${dir} · ${e.category || ""} · ${e.move || ""}${detail}${tie} · ${od.label}${pts} · ${e.timestamp || ""}`;
-    }
 
     /* OFFICIAL DUAL BOUT SHEET & SEASON MATCH LEDGER */
     function renderBoutSheet(target) {
@@ -13470,20 +13414,6 @@ async function testClipServerConnection() {
       }).length;
     }
 
-    function buildLeadersForMetric(athletes, getVal, formatVal) {
-      const items = [];
-      athletes.forEach(w => {
-        const val = getVal(w);
-        if (val > 0 || (typeof val === "number" && !isNaN(val) && formatVal)) {
-          // for proficiency formatVal is set and we filter by opps outside
-          if (val === 0 && !formatVal) return;
-          const item = { ...w, val };
-          if (formatVal) item.displayVal = formatVal(val);
-          items.push(item);
-        }
-      });
-      return items;
-    }
 
     function countRidingTimePoints(wrestlerId) {
       const season = getActiveSeason();
@@ -13888,21 +13818,6 @@ async function testClipServerConnection() {
         }
         return true;
       });
-    }
-    function getTeamStanding(statKey, value, higherIsBetter) {
-      const pool = rosterPoolForStanding();
-      if (!pool.length) return "—";
-      const vals = pool.map(w => {
-        const b = computeRawStatsBundle(w.id);
-        return { id: w.id, v: b[statKey] };
-      });
-      // For proficiency use nested
-      vals.sort((a, b) => higherIsBetter === false ? (a.v - b.v) : (b.v - a.v));
-      const activeW = getActiveWrestler();
-      if (!activeW || statsShowTeam) return "—";
-      const rank = vals.findIndex(x => x.id === activeW.id) + 1;
-      if (rank <= 0) return "—";
-      return rank + "/" + vals.length;
     }
 function computeRawStatsBundle(wrestlerId) {
       const season = getActiveSeason();
@@ -15055,13 +14970,6 @@ function computeRawStatsBundle(wrestlerId) {
       persistRecordBook();
     }
 
-    function filterRecordRows(rows, division) {
-      let list = rows || [];
-      if (division && division !== "All") {
-        list = list.filter(r => (r.division || "Boys") === division);
-      }
-      return list;
-    }
 
     function buildRecordBookData(scope) {
       try { refreshRecordBookFromAllSeasons(); } catch (e) { console.warn(e); }
@@ -16022,9 +15930,6 @@ function computeRawStatsBundle(wrestlerId) {
       return `<button type="button" class="btn-back" style="font-size:10px; padding:3px 8px; flex-shrink:0;" onclick="event.stopPropagation(); toggleAdminSection('${swJs(key)}')">${hidden ? 'Show' : 'Hide'}</button>`;
     }
 
-    function adminSecStyle(key) {
-      return isAdminSectionHidden(key) ? 'display:none;' : '';
-    }
 
     function adminSecHeader(key, title) {
       const hidden = isAdminSectionHidden(key);
@@ -16034,12 +15939,6 @@ function computeRawStatsBundle(wrestlerId) {
       </div>`;
     }
 
-    function adminCardHeader(key, titleHtml) {
-      return `<div class="card-title" style="margin-bottom:0;">
-        <span>${titleHtml}</span>
-        <span style="display:flex; align-items:center; gap:6px;">${adminHideShowBtn(key)}</span>
-      </div>`;
-    }
 
     /** Collapsible Admin row: when hidden, only title + Show (no empty box). */
     function adminSectionBlock(key, title, bodyHtml, opts) {
@@ -18314,21 +18213,6 @@ const aiBody = `
     }
 
     
-    function adminModifierStyleChecksHtml(modName) {
-      const tags = modifierStyleTags[modName];
-      // null/empty = all styles (except Greco default hide list still applies in filter)
-      const all = !tags || !tags.length;
-      const folk = all || tags.includes("Folkstyle");
-      const free = all || tags.includes("Freestyle");
-      const greco = all || tags.includes("Greco");
-      const esc = String(modName).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-      return `<span style="display:inline-flex; gap:4px; align-items:center; font-size:9px; color:var(--muted);">
-        <span style="font-weight:700;">Available in:</span>
-        <label style="display:inline-flex; gap:2px; align-items:center; cursor:pointer;"><input type="checkbox" ${folk ? "checked" : ""} onchange="setModifierStyleTag('${swJs(esc)}', 'Folkstyle', this.checked)" />Folkstyle</label>
-        <label style="display:inline-flex; gap:2px; align-items:center; cursor:pointer;"><input type="checkbox" ${free ? "checked" : ""} onchange="setModifierStyleTag('${swJs(esc)}', 'Freestyle', this.checked)" />Freestyle</label>
-        <label style="display:inline-flex; gap:2px; align-items:center; cursor:pointer;"><input type="checkbox" ${greco ? "checked" : ""} onchange="setModifierStyleTag('${swJs(esc)}', 'Greco', this.checked)" />Greco-Roman</label>
-      </span>`;
-    }
     function setModifierStyleTag(modName, style, on) {
       let tags = modifierStyleTags[modName] ? modifierStyleTags[modName].slice() : ["Folkstyle", "Freestyle", "Greco"];
       if (!modifierStyleTags[modName] || !modifierStyleTags[modName].length) {
@@ -20635,7 +20519,7 @@ const aiBody = `
       // Rebuild modifiers from Opp:/Our: if needed
       if (!modifiers || (!((modifiers.opp||{}).ties||[]).length && !((modifiers.our||{}).ties||[]).length
           && !((modifiers.opp||{}).finishes||[]).length && !((modifiers.our||{}).finishes||[]).length)) {
-        modifiers = parseModifiersPlain(tiePlain || tie || "");
+        modifiers = parseModifiersPlain(tie || "");
       }
       // Strip free-form modifier names not in taxonomy lists
       const allowedTies = new Set((taxonomy.TIE_MODIFIERS || []).map(x => x.toLowerCase()));
@@ -20647,9 +20531,7 @@ const aiBody = `
         side.rides = (side.rides || []).filter(n => allowedRide.has(String(n).toLowerCase()));
       };
       if (modifiers) { filterSide(modifiers.opp || (modifiers.opp = {ties:[],finishes:[],rides:[]})); filterSide(modifiers.our || (modifiers.our = {ties:[],finishes:[],rides:[]})); }
-      tiePlain = formatModifiersPlainFromStruct(modifiers) || tiePlain;
-
-      tiePlain = formatModifiersPlainFromStruct(modifiers) || tie;
+      const tiePlain = formatModifiersPlainFromStruct(modifiers) || tie;
       return {
         id: makeId("id"),
         matchId: null,
@@ -21381,6 +21263,8 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
         modifierStyleTags: (typeof modifierStyleTags !== "undefined") ? modifierStyleTags : undefined,
         aiTrainingPlanCache: (typeof aiTrainingPlanCache !== "undefined" && aiTrainingPlanCache) ? aiTrainingPlanCache : {},
         recordBook: (typeof recordBook !== "undefined" && recordBook) ? recordBook : null,
+        highlightClips: (typeof highlightClipsStore !== "undefined" && Array.isArray(highlightClipsStore)) ? highlightClipsStore : undefined,
+        highlightReels: (typeof highlightReelsStore !== "undefined" && Array.isArray(highlightReelsStore)) ? highlightReelsStore : undefined,
         recordBookSnapshot: (typeof buildRecordBookData === "function") ? { season: buildRecordBookData("season"), career: buildRecordBookData("career") } : null,
         // Explicit aliases for clarity (same data lives in store for seasons/roster/matches/events/calendar)
         note: "store includes seasons (roster, bouts/events, matches, scoring events, attendance/calendar). Also: taxonomy, weights, branding, theme, appConfig, awards, gear, opponent memory, AI training library + plan cache."
@@ -21412,6 +21296,13 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       if (payload.recordBook && typeof payload.recordBook === "object") {
         recordBook = payload.recordBook;
         try { persistRecordBook(); } catch (e) {}
+      }
+      if (Array.isArray(payload.highlightClips) || Array.isArray(payload.highlightReels)) {
+        try {
+          if (Array.isArray(payload.highlightClips)) highlightClipsStore = payload.highlightClips;
+          if (Array.isArray(payload.highlightReels)) highlightReelsStore = payload.highlightReels;
+          persistHighlightStores();
+        } catch (e) { console.warn("restore highlights", e); }
       }
       if (payload.gearInventory) gearInventory = payload.gearInventory;
       if (payload.aiTrainingPlanCache && typeof payload.aiTrainingPlanCache === "object") {
@@ -22212,9 +22103,6 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       if (/^women$/i.test(d)) return men ? "Women" : "Girls";
       return d;
     }
-    function divisionPairLabel() {
-      return usesMenWomenPronouns() ? "Men / Women" : "Boys / Girls";
-    }
 
     function setDownloadTargetFromBadge(target) {
       const t = (target === "local") ? "local" : "drive";
@@ -22378,9 +22266,6 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
 
     function preferGoogleDriveSaves() {
       return (appConfig.downloadTarget || "drive") === "drive";
-    }
-    function preferGoogleDriveWhenConnected() {
-      return preferGoogleDriveSaves() && isGoogleSignedIn();
     }
     function resolveIoTarget(actionLabel) {
       const wantDrive = preferGoogleDriveSaves();
@@ -23888,12 +23773,21 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
       STORAGE_KEY, TAXONOMY_STORAGE_KEY, WEIGHT_CLASSES_STORAGE_KEY, BRANDING_STORAGE_KEY, COLOR_THEME_STORAGE_KEY,
       CONFIG_STORAGE_KEY, AWARDS_STORAGE_KEY, GEAR_STORAGE_KEY, ROSTER_LIBRARY_KEY, AI_TRAINING_LIBRARY_KEY,
       OPPONENT_ROSTER_MEMORY_KEY, OPPONENT_SCHOOL_IMPORT_FLAGS_KEY, LAYOUT_STORAGE_KEY, ADMIN_SECTIONS_STORAGE_KEY,
-      APPEARANCE_STORAGE_KEY, MOVE_STYLE_TAGS_KEY, MODIFIER_STYLE_TAGS_KEY
+      APPEARANCE_STORAGE_KEY, MOVE_STYLE_TAGS_KEY, MODIFIER_STYLE_TAGS_KEY, RECORD_BOOK_KEY
     ]);
-    window.onload = async function() {
+    /** Start the app as soon as the DOM is parsed — NOT on window.onload, which waits for every external script/image. */
+    async function swBoot() {
+      const bootMsgTimer = setTimeout(function () {
+        const m = document.getElementById("sw-boot-msg");
+        if (m) m.textContent = "Still opening your data… browser storage is responding slowly. Please keep this tab open.";
+      }, 6000);
       try { SWDB.hooks.toast = toast; } catch (e) {}
       try { await swStorageReady; } catch (e) {}
-      if (typeof init === "function") init();
+      try { loadRecordBookFromStorage(); } catch (e) {}
+      try { if (typeof init === "function") init(); } finally {
+        clearTimeout(bootMsgTimer);
+        const bs = document.getElementById("sw-boot-status"); if (bs && bs.parentNode) bs.parentNode.removeChild(bs);
+      }
       try {
         // Recovery point = exactly what was on disk before this session's edits.
         if (SWDB.mode() === "idb" && Date.now() - SWDB.lastSnapshotAt() > 60 * 60 * 1000) SWDB.snapshot("Session start", false);
@@ -23909,7 +23803,9 @@ async function callLocalLoraPredict(systemText, frames, statusDiv) {
           hideLoginGate();
         }
       } catch (e) {}
-    };
+    }
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", swBoot);
+    else swBoot();
 
   </script>
 </body>
